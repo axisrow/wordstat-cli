@@ -65,3 +65,18 @@ class CollectionResult(BaseModel):
     run_directory: Path
     manifest_path: Path
     manifest: CollectionManifest
+
+
+class CollectionFailure(BaseModel):
+    """A phrase which could not be collected in a batch run."""
+
+    phrase: str
+    error: str
+
+
+class BatchCollectionResult(BaseModel):
+    """Results and failures from collecting several phrases in one session."""
+
+    total: int
+    results: list[CollectionResult]
+    failures: list[CollectionFailure]

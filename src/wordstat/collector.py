@@ -2,7 +2,10 @@
 
 import asyncio
 import json
+import shutil
+import tempfile
 import time
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -17,7 +20,14 @@ from wordstat.errors import (
     InvalidRequestError,
     PhraseEntryError,
 )
-from wordstat.models import CollectionManifest, CollectionResult, ExportSummary, WordstatView
+from wordstat.models import (
+    BatchCollectionResult,
+    CollectionFailure,
+    CollectionManifest,
+    CollectionResult,
+    ExportSummary,
+    WordstatView,
+)
 from wordstat.storage import create_run_directory, finalize_raw, write_manifest
 
 WORDSTAT_URL = "https://wordstat.yandex.ru/"
@@ -54,19 +64,38 @@ class WordstatCollector:
 
     async def collect(self, phrase: str, region: str = "Россия") -> CollectionResult:
         """Collect popular, related, dynamics and regional reports for one phrase."""
+        batch = await self.collect_many([phrase], region=region)
+        if batch.failures:
+            # Preserve the single-phrase API's original exception behavior.
+            raise InvalidRequestError(batch.failures[0].error)
+        return batch.results[0]
 
-        phrase = phrase.strip()
+    async def collect_many(
+        self, phrases: Sequence[str], region: str = "Россия"
+    ) -> BatchCollectionResult:
+        """Collect several phrases while reusing one browser session."""
+
         region = region.strip()
-        if not phrase:
-            raise InvalidRequestError("The search phrase must not be empty")
         if not region:
             raise InvalidRequestError("The region must not be empty")
+        normalized = [phrase.strip() for phrase in phrases]
+        results: list[CollectionResult] = []
+        failures: list[CollectionFailure] = []
+        valid_phrases = [phrase for phrase in normalized if phrase]
+        for phrase in normalized:
+            if not phrase:
+                failures.append(CollectionFailure(phrase=phrase, error="The search phrase must not be empty"))
+        if not valid_phrases:
+            return BatchCollectionResult(total=len(normalized), results=[], failures=failures)
 
-        run_directory = create_run_directory(self.output_root, phrase)
+        self.output_root.mkdir(parents=True, exist_ok=True)
+        downloads_directory = Path(tempfile.mkdtemp(prefix=".downloads-", dir=self.output_root))
         session = BrowserSession(
             cdp_url=self.cdp_url,
             is_local=True,
-            downloads_path=run_directory,
+            # A single session is shared by all phrases. Downloads are moved
+            # into each phrase's run directory after conversion.
+            downloads_path=downloads_directory,
             allowed_domains=["wordstat.yandex.ru", "passport.yandex.ru"],
             keep_alive=True,
         )
@@ -76,44 +105,40 @@ class WordstatCollector:
             await page.goto(WORDSTAT_URL)
             await self._wait_for(page, f"() => Boolean(document.querySelector({json.dumps(QUERY_SELECTOR)}))")
             await self._assert_authenticated(page)
-            await self._set_phrase(page, phrase)
             await self._set_region(page, region)
-
-            exports = []
-            for view, selector in VIEW_SELECTORS.items():
-                await self._select_view(page, selector)
-                source = await self._download_current_view(page, session, run_directory)
-                dataset = parse_wordstat_csv(source, view)
-                # Convert before disposing of the download, so a parse failure
-                # leaves the raw CSV on disk to inspect.
-                data_path, dtypes = write_dataset(dataset, run_directory)
-                raw_path = finalize_raw(source, run_directory, view, self.keep_raw)
-                exports.append(
-                    ExportSummary(
-                        view=view,
-                        file=data_path.name,
-                        raw_file=raw_path.name if raw_path else None,
-                        row_count=len(dataset.rows),
-                        dtypes=dtypes,
-                    )
-                )
-
-            manifest = CollectionManifest(
-                phrase=phrase,
-                region=region,
-                created_at=datetime.now(UTC),
-                source_url=await page.get_url(),
-                exports=exports,
-            )
-            manifest_path = run_directory / "manifest.json"
-            write_manifest(manifest_path, manifest)
-            return CollectionResult(
-                run_directory=run_directory,
-                manifest_path=manifest_path,
-                manifest=manifest,
-            )
+            for phrase in valid_phrases:
+                try:
+                    results.append(await self._collect_phrase(page, session, phrase, region))
+                except Exception as error:  # batch isolation is intentional
+                    failures.append(CollectionFailure(phrase=phrase, error=str(error)))
         finally:
             await session.stop()
+            shutil.rmtree(downloads_directory, ignore_errors=True)
+        return BatchCollectionResult(total=len(normalized), results=results, failures=failures)
+
+    async def _collect_phrase(self, page, session: BrowserSession, phrase: str, region: str) -> CollectionResult:
+        run_directory = create_run_directory(self.output_root, phrase)
+        await self._set_phrase(page, phrase)
+        exports = []
+        for view, selector in VIEW_SELECTORS.items():
+            await self._select_view(page, selector)
+            source = await self._download_current_view(page, session, run_directory)
+            dataset = parse_wordstat_csv(source, view)
+            data_path, dtypes = write_dataset(dataset, run_directory)
+            raw_path = finalize_raw(source, run_directory, view, self.keep_raw)
+            exports.append(
+                ExportSummary(
+                    view=view, file=data_path.name, raw_file=raw_path.name if raw_path else None,
+                    row_count=len(dataset.rows), dtypes=dtypes,
+                )
+            )
+        manifest = CollectionManifest(
+            phrase=phrase, region=region, created_at=datetime.now(UTC),
+            source_url=await page.get_url(), exports=exports,
+        )
+        manifest_path = run_directory / "manifest.json"
+        write_manifest(manifest_path, manifest)
+        return CollectionResult(run_directory=run_directory, manifest_path=manifest_path, manifest=manifest)
 
     async def _assert_authenticated(self, page) -> None:
         state = await page.evaluate(
