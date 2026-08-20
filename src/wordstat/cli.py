@@ -18,8 +18,30 @@ def main() -> None:
     """Collect validated Yandex Wordstat reports as Parquet datasets."""
 
 
+def resolve_phrases(phrase_args: tuple[str, ...], phrases_file: Path | None) -> list[str]:
+    """Merge PHRASE arguments and --phrases-file into one ordered phrase list.
+
+    Blank lines in the file are dropped; phrases are not deduplicated, so
+    requesting the same phrase twice collects it twice into two run
+    directories. Whitespace is left untouched here — WordstatCollector is the
+    single place that strips and validates each phrase.
+    """
+
+    phrases = list(phrase_args)
+    if phrases_file is not None:
+        lines = phrases_file.read_text(encoding="utf-8").splitlines()
+        phrases.extend(line for line in lines if line.strip())
+    return phrases
+
+
 @main.command()
-@click.argument("phrase")
+@click.argument("phrase", nargs=-1)
+@click.option(
+    "--phrases-file",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    default=None,
+    help="Path to a file with one search phrase per line, collected alongside any PHRASE arguments.",
+)
 @click.option("--region", default="Россия", show_default=True, help="Exact region label in the Wordstat selector.")
 @click.option(
     "--output-dir",
@@ -35,8 +57,25 @@ def main() -> None:
     default=False,
     help="Keep each downloaded CSV as <view>.csv instead of discarding it after conversion.",
 )
-def collect(phrase: str, region: str, output_dir: Path, cdp_url: str, timeout_seconds: float, keep_raw: bool) -> None:
-    """Collect all MVP Wordstat reports for PHRASE as Parquet datasets."""
+def collect(
+    phrase: tuple[str, ...],
+    phrases_file: Path | None,
+    region: str,
+    output_dir: Path,
+    cdp_url: str,
+    timeout_seconds: float,
+    keep_raw: bool,
+) -> None:
+    """Collect all MVP Wordstat reports for one or more PHRASE as Parquet datasets.
+
+    Accepts several PHRASE arguments and/or --phrases-file; all phrases are
+    collected inside a single browser session. A failure on one phrase is
+    reported and does not stop the rest of the batch.
+    """
+
+    phrases = resolve_phrases(phrase, phrases_file)
+    if not phrases:
+        raise click.ClickException("At least one search phrase is required")
 
     collector = WordstatCollector(
         cdp_url=cdp_url,
@@ -45,9 +84,19 @@ def collect(phrase: str, region: str, output_dir: Path, cdp_url: str, timeout_se
         keep_raw=keep_raw,
     )
     try:
-        result = asyncio.run(collector.collect(phrase=phrase, region=region))
+        batch = asyncio.run(collector.collect_many(phrases, region=region))
     # Only domain errors become friendly messages; an unexpected ValueError
     # from a dependency should keep its traceback instead of being reworded.
     except WordstatError as error:
         raise click.ClickException(str(error)) from error
-    click.echo(result.manifest_path)
+
+    for result in batch.results:
+        click.echo(result.manifest_path)
+    for failure in batch.failures:
+        click.echo(f"{failure.phrase}: {failure.error}", err=True)
+
+    total = len(phrases)
+    collected = len(batch.results)
+    click.echo(f"Собрано {collected} из {total}", err=True)
+    if batch.failures:
+        raise SystemExit(1)

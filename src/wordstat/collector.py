@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -12,12 +13,20 @@ from wordstat.csv_io import parse_wordstat_csv
 from wordstat.dataset_io import write_dataset
 from wordstat.errors import (
     AuthenticationRequiredError,
+    CsvFormatError,
     DownloadTimeoutError,
     InterfaceChangedError,
     InvalidRequestError,
     PhraseEntryError,
 )
-from wordstat.models import CollectionManifest, CollectionResult, ExportSummary, WordstatView
+from wordstat.models import (
+    BatchCollectionResult,
+    CollectionManifest,
+    CollectionResult,
+    ExportSummary,
+    PhraseFailure,
+    WordstatView,
+)
 from wordstat.storage import create_run_directory, finalize_raw, write_manifest
 
 WORDSTAT_URL = "https://wordstat.yandex.ru/"
@@ -55,65 +64,160 @@ class WordstatCollector:
     async def collect(self, phrase: str, region: str = "Россия") -> CollectionResult:
         """Collect popular, related, dynamics and regional reports for one phrase."""
 
-        phrase = phrase.strip()
+        batch = await self.collect_many([phrase], region=region)
+        if batch.failures:
+            raise batch.failures[0].error
+        return batch.results[0]
+
+    async def collect_many(self, phrases: list[str], region: str = "Россия") -> BatchCollectionResult:
+        """Collect reports for several phrases inside a single browser session.
+
+        A failure on one phrase is recorded and does not stop the remaining
+        phrases, so a large batch does not throw away everything it already
+        collected because of one bad phrase.  A lost authentication, however,
+        means the session itself is no longer usable, so it aborts the batch
+        instead of repeating the same failure for every remaining phrase.
+        """
+
         region = region.strip()
-        if not phrase:
-            raise InvalidRequestError("The search phrase must not be empty")
+        if not phrases:
+            raise InvalidRequestError("At least one search phrase is required")
         if not region:
             raise InvalidRequestError("The region must not be empty")
 
+        cleaned_phrases = []
+        for phrase in phrases:
+            phrase = phrase.strip()
+            if not phrase:
+                raise InvalidRequestError("The search phrase must not be empty")
+            cleaned_phrases.append(phrase)
+
+        results: list[CollectionResult] = []
+        failures: list[PhraseFailure] = []
+
+        # create_run_directory() used to be the first thing that created
+        # output_root (via mkdir(parents=True)). The shared downloads
+        # directory below is now created before any run directory, so
+        # output_root has to exist first, or a fresh --output-dir fails with
+        # a bare FileNotFoundError instead of a WordstatError.
+        self.output_root.mkdir(parents=True, exist_ok=True)
+
+        # One downloads directory for the whole batch: BrowserSession fixes
+        # downloads_path at construction time, but each phrase needs its own
+        # run directory (built from its own slug). Downloads land in this
+        # shared holding area and are moved into the per-phrase run directory
+        # as they are converted; nothing is left behind because
+        # finalize_raw/parquet writing always relocates or deletes the file.
+        with tempfile.TemporaryDirectory(dir=self.output_root, prefix=".downloads-") as downloads_dir:
+            downloads_path = Path(downloads_dir)
+            session = BrowserSession(
+                cdp_url=self.cdp_url,
+                is_local=True,
+                downloads_path=downloads_path,
+                allowed_domains=["wordstat.yandex.ru", "passport.yandex.ru"],
+                keep_alive=True,
+            )
+            try:
+                await session.start()
+                page = await session.new_page()
+                await page.goto(WORDSTAT_URL)
+                await self._wait_for(page, f"() => Boolean(document.querySelector({json.dumps(QUERY_SELECTOR)}))")
+                await self._assert_authenticated(page)
+
+                for phrase in cleaned_phrases:
+                    try:
+                        result = await self._collect_one(page, session, downloads_path, phrase, region)
+                        results.append(result)
+                    except AuthenticationRequiredError as error:
+                        # The session itself is gone: every remaining phrase
+                        # would fail the same way, so stop instead of piling
+                        # up identical failures.
+                        failures.append(PhraseFailure(phrase=phrase, error=error))
+                        break
+                    except (
+                        InterfaceChangedError,
+                        PhraseEntryError,
+                        DownloadTimeoutError,
+                        CsvFormatError,
+                    ) as error:
+                        failures.append(PhraseFailure(phrase=phrase, error=error))
+            finally:
+                await session.stop()
+
+        return BatchCollectionResult(results=results, failures=failures)
+
+    async def _collect_one(
+        self,
+        page,
+        session: BrowserSession,
+        downloads_path: Path,
+        phrase: str,
+        region: str,
+    ) -> CollectionResult:
         run_directory = create_run_directory(self.output_root, phrase)
-        session = BrowserSession(
-            cdp_url=self.cdp_url,
-            is_local=True,
-            downloads_path=run_directory,
-            allowed_domains=["wordstat.yandex.ru", "passport.yandex.ru"],
-            keep_alive=True,
-        )
-        try:
-            await session.start()
-            page = await session.new_page()
-            await page.goto(WORDSTAT_URL)
-            await self._wait_for(page, f"() => Boolean(document.querySelector({json.dumps(QUERY_SELECTOR)}))")
-            await self._assert_authenticated(page)
-            await self._set_phrase(page, phrase)
-            await self._set_region(page, region)
+        # In a batch, the previous phrase's table can still be sitting in the
+        # DOM when _set_phrase's own waits (new `words=` in the URL, download
+        # button present) are satisfied — those don't check the table itself.
+        # Snapshot it before switching phrases so we can confirm afterwards
+        # that Wordstat actually re-rendered for the new phrase, instead of
+        # silently downloading the previous phrase's data under this one's
+        # name.
+        previous_table = await self._table_snapshot(page)
+        await self._set_phrase(page, phrase)
+        # Re-applied per phrase: the control is idempotent (it only clicks
+        # checkboxes that are not already in the desired state), and a region
+        # silently reverting to "Все регионы" across a batch would be far
+        # worse than the extra clicks.
+        await self._set_region(page, region)
+        if previous_table is not None:
+            await self._wait_for(
+                page,
+                f"() => document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.textContent"
+                f" !== {json.dumps(previous_table)}",
+            )
 
-            exports = []
-            for view, selector in VIEW_SELECTORS.items():
-                await self._select_view(page, selector)
-                source = await self._download_current_view(page, session, run_directory)
+        exports = []
+        for view, selector in VIEW_SELECTORS.items():
+            await self._select_view(page, selector)
+            source = await self._download_current_view(page, session, downloads_path)
+            try:
                 dataset = parse_wordstat_csv(source, view)
-                # Convert before disposing of the download, so a parse failure
-                # leaves the raw CSV on disk to inspect.
-                data_path, dtypes = write_dataset(dataset, run_directory)
-                raw_path = finalize_raw(source, run_directory, view, self.keep_raw)
-                exports.append(
-                    ExportSummary(
-                        view=view,
-                        file=data_path.name,
-                        raw_file=raw_path.name if raw_path else None,
-                        row_count=len(dataset.rows),
-                        dtypes=dtypes,
-                    )
+            except CsvFormatError:
+                # source lives in the batch's shared, temporary downloads
+                # directory; it would otherwise vanish with that directory
+                # once the batch finishes. Rescue it into this phrase's own
+                # run directory first, so "the CSV stays on disk to inspect"
+                # still holds for CsvFormatError, per CLAUDE.md.
+                source.replace(run_directory / source.name)
+                raise
+            # Convert before disposing of the download, so a parse failure
+            # leaves the raw CSV on disk to inspect.
+            data_path, dtypes = write_dataset(dataset, run_directory)
+            raw_path = finalize_raw(source, run_directory, view, self.keep_raw)
+            exports.append(
+                ExportSummary(
+                    view=view,
+                    file=data_path.name,
+                    raw_file=raw_path.name if raw_path else None,
+                    row_count=len(dataset.rows),
+                    dtypes=dtypes,
                 )
+            )
 
-            manifest = CollectionManifest(
-                phrase=phrase,
-                region=region,
-                created_at=datetime.now(UTC),
-                source_url=await page.get_url(),
-                exports=exports,
-            )
-            manifest_path = run_directory / "manifest.json"
-            write_manifest(manifest_path, manifest)
-            return CollectionResult(
-                run_directory=run_directory,
-                manifest_path=manifest_path,
-                manifest=manifest,
-            )
-        finally:
-            await session.stop()
+        manifest = CollectionManifest(
+            phrase=phrase,
+            region=region,
+            created_at=datetime.now(UTC),
+            source_url=await page.get_url(),
+            exports=exports,
+        )
+        manifest_path = run_directory / "manifest.json"
+        write_manifest(manifest_path, manifest)
+        return CollectionResult(
+            run_directory=run_directory,
+            manifest_path=manifest_path,
+            manifest=manifest,
+        )
 
     async def _assert_authenticated(self, page) -> None:
         state = await page.evaluate(
@@ -227,13 +331,18 @@ class WordstatCollector:
         )
         await asyncio.sleep(0.5)
 
-    async def _download_current_view(self, page, session: BrowserSession, run_directory: Path) -> Path:
-        # macOS resolves /tmp to /private/tmp; the run directory and
+    async def _table_snapshot(self, page) -> str | None:
+        return await page.evaluate(
+            f"() => document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.textContent ?? null"
+        )
+
+    async def _download_current_view(self, page, session: BrowserSession, downloads_path: Path) -> Path:
+        # macOS resolves /tmp to /private/tmp; the downloads directory and
         # session.downloaded_files can report the same physical file under
         # different unresolved paths, which would otherwise look like two
         # distinct downloads. Compare resolved paths, keep the original for
         # return.
-        before = self._resolved_file_snapshot(run_directory, session)
+        before = self._resolved_file_snapshot(downloads_path, session)
         # "Скачать" now opens a format menu (CSV / XLSX) instead of downloading
         # directly; a second click on the CSV entry is required.
         await self._click(page, DOWNLOAD_SELECTOR)
@@ -243,7 +352,7 @@ class WordstatCollector:
         await self._click(page, DOWNLOAD_CSV_MENU_ITEM_SELECTOR)
         deadline = time.monotonic() + self.timeout_seconds
         while time.monotonic() < deadline:
-            current = self._resolved_file_snapshot(run_directory, session)
+            current = self._resolved_file_snapshot(downloads_path, session)
             new_resolved = set(current) - set(before)
             csv_files = [current[resolved] for resolved in new_resolved if resolved.suffix.lower() == ".csv"]
             if len(csv_files) == 1 and csv_files[0].stat().st_size > 0:
@@ -302,7 +411,7 @@ class WordstatCollector:
 
         Keying by the resolved path lets set difference correctly dedupe a
         file that appears under two unresolved forms (e.g. /tmp vs
-        /private/tmp on macOS) between run_directory globbing and
+        /private/tmp on macOS) between downloads-directory globbing and
         session.downloaded_files.
         """
         paths = {path for path in directory.glob("*") if path.is_file()}

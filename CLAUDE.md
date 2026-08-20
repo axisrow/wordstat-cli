@@ -34,6 +34,8 @@ Chrome должен быть запущен с доступным CDP endpoint (
 ```bash
 # запуск CLI
 wordstat collect "ремонт квартир" --region "Москва" --output-dir ./wordstat-output
+# batch: несколько фраз за один прогон, одна BrowserSession на все
+wordstat collect "ремонт квартир" "натяжные потолки" --phrases-file phrases.txt
 # --cdp-url / WORDSTAT_CDP_URL, --timeout (сек, по умолчанию 45)
 # --keep-raw — оставить скачанные CSV как <view>.csv рядом с parquet
 
@@ -52,15 +54,37 @@ ruff check .
 контрактом между слоями и доменными исключениями (`errors.py`), которые CLI
 превращает в `click.ClickException`.
 
-- **`collector.py` (`WordstatCollector.collect`)** — единственное место, где
-  происходит взаимодействие с браузером через `browser_use.BrowserSession`
+- **`collector.py` (`WordstatCollector.collect_many`)** — единственное место,
+  где происходит взаимодействие с браузером через `browser_use.BrowserSession`
   (CDP-подключение к уже запущенному Chrome, `keep_alive=True`,
-  `allowed_domains` ограничены доменами Wordstat/Passport). Последовательность
-  жёстко детерминирована: открыть Wordstat → проверить авторизацию
+  `allowed_domains` ограничены доменами Wordstat/Passport). Одна сессия и одна
+  страница обслуживают весь батч фраз; `collect` — тонкая обёртка над
+  `collect_many([phrase])` для одной фразы. Последовательность жёстко
+  детерминирована: открыть Wordstat → проверить авторизацию
   (`_assert_authenticated`, ищет ссылку «Выйти», иначе кидает
-  `AuthenticationRequiredError`) → ввести фразу → выбрать регион → для каждого
+  `AuthenticationRequiredError`) → для каждой фразы: ввести фразу → выбрать
+  регион (переустанавливается на каждой фразе — идемпотентен) → для каждого
   из четырёх видов отчёта (`WordstatView`) переключить вкладку, скачать CSV,
   распарсить, записать `<view>.parquet` и убрать исходную загрузку.
+  - Падение одной фразы (`InterfaceChangedError`, `PhraseEntryError`,
+    `DownloadTimeoutError`, `CsvFormatError`, `InvalidRequestError`) не
+    прерывает батч — фраза уходит в `BatchCollectionResult.failures`, и цикл
+    продолжается со следующей. `AuthenticationRequiredError` посреди батча
+    означает, что сессия умерла целиком — батч прерывается сразу, без попыток
+    оставшихся фраз.
+  - `downloads_path` у `BrowserSession` фиксируется при создании сессии, а
+    каждой фразе нужен свой run-каталог — поэтому у сессии один общий
+    временный каталог загрузок на весь батч (`tempfile.TemporaryDirectory`
+    внутри `output_root`), а каждый файл сразу после скачивания
+    парсится/переносится в свой `<run_directory>` через `write_dataset`/
+    `finalize_raw`.
+  - Перед вводом новой фразы (`_collect_one`) снимается снапшот текста первой
+    строки таблицы; после `_set_phrase`/`_set_region` ожидается, что он
+    изменится. `_set_phrase` сама проверяет только URL и кнопку скачивания, не
+    содержимое таблицы — без этой проверки можно тихо скачать данные
+    предыдущей фразы под именем следующей. Не проверено вручную на живом
+    авторизованном Chrome; в редком случае, если у двух разных фраз совпадёт
+    текст первой строки таблицы, проверка ложно не сработает.
   - Порядок «скачать → распарсить → записать parquet → убрать raw» обязателен:
     при `CsvFormatError` скачанный CSV остаётся на диске для разбора.
   - Все клики/проверки идут через `page.evaluate` с CSS-селекторами и строгой

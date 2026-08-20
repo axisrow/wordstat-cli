@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class WordstatView(StrEnum):
@@ -65,3 +65,30 @@ class CollectionResult(BaseModel):
     run_directory: Path
     manifest_path: Path
     manifest: CollectionManifest
+
+
+class PhraseFailure(BaseModel):
+    """One phrase's failure inside a batch collection.
+
+    ``error`` carries the original :class:`~wordstat.errors.WordstatError` so
+    the CLI can report the real cause instead of a generic message.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    phrase: str
+    error: Exception
+
+
+class BatchCollectionResult(BaseModel):
+    """Outcome of collecting several phrases inside one browser session.
+
+    A phrase that failed is recorded in ``failures`` instead of aborting the
+    whole batch (see :meth:`WordstatCollector.collect_many`), so ``results``
+    and ``failures`` together account for every requested phrase.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    results: list[CollectionResult]
+    failures: list[PhraseFailure]
