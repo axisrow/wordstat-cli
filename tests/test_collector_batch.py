@@ -72,7 +72,9 @@ def _patch_common(monkeypatch):
 
 
 def _patch_collect_one(monkeypatch, behavior):
-    async def fake_collect_one(self, page, session, downloads_path, phrase, region, set_region=True):
+    async def fake_collect_one(
+        self, page, session, downloads_path, phrase, region, set_region=True, on_region_applied=None
+    ):
         return await behavior(phrase)
 
     monkeypatch.setattr(WordstatCollector, "_collect_one", fake_collect_one)
@@ -140,7 +142,7 @@ def test_collect_many_aborts_on_lost_authentication_without_trying_the_rest(monk
     _patch_common(monkeypatch)
     attempted = []
 
-    async def collect_one(self, page, session, downloads_path, phrase, region, set_region=True):
+    async def collect_one(self, page, session, downloads_path, phrase, region, set_region=True, on_region_applied=None):
         attempted.append(phrase)
         if phrase == "второй":
             raise AuthenticationRequiredError("session lost")
@@ -184,7 +186,7 @@ def _patch_collect_one_passthrough(monkeypatch, tmp_path):
     """Let _collect_one call the real _assert_authenticated, then
     short-circuit the rest of the browser interaction."""
 
-    async def passthrough(self, page, session, downloads_path, phrase, region, set_region=True):
+    async def passthrough(self, page, session, downloads_path, phrase, region, set_region=True, on_region_applied=None):
         await self._assert_authenticated(page)
         return _fake_result(tmp_path, phrase)
 
@@ -202,8 +204,12 @@ def test_collect_many_only_sets_region_for_the_first_phrase(monkeypatch, tmp_pat
     _patch_common(monkeypatch)
     set_region_calls = []
 
-    async def recording_collect_one(self, page, session, downloads_path, phrase, region, set_region=True):
+    async def recording_collect_one(
+        self, page, session, downloads_path, phrase, region, set_region=True, on_region_applied=None
+    ):
         set_region_calls.append(set_region)
+        if set_region and on_region_applied is not None:
+            on_region_applied()
         return _fake_result(tmp_path, phrase)
 
     monkeypatch.setattr(WordstatCollector, "_collect_one", recording_collect_one)
@@ -226,10 +232,15 @@ def test_collect_many_retries_region_after_the_first_phrase_fails(monkeypatch, t
     _patch_common(monkeypatch)
     set_region_calls = []
 
-    async def recording_collect_one(self, page, session, downloads_path, phrase, region, set_region=True):
+    async def recording_collect_one(
+        self, page, session, downloads_path, phrase, region, set_region=True, on_region_applied=None
+    ):
         set_region_calls.append(set_region)
         if phrase == "первый":
+            # Fails before the region would have been confirmed.
             raise PhraseEntryError("boom before region confirmed")
+        if set_region and on_region_applied is not None:
+            on_region_applied()
         return _fake_result(tmp_path, phrase)
 
     monkeypatch.setattr(WordstatCollector, "_collect_one", recording_collect_one)
@@ -238,6 +249,46 @@ def test_collect_many_retries_region_after_the_first_phrase_fails(monkeypatch, t
     batch = asyncio.run(collector.collect_many(["первый", "второй", "третий"]))
 
     assert set_region_calls == [True, True, False]
+    assert [f.phrase for f in batch.failures] == ["первый"]
+    assert [r.run_directory.name for r in batch.results] == ["второй", "третий"]
+
+
+def test_collect_many_does_not_retry_region_if_it_was_applied_before_a_later_failure(monkeypatch, tmp_path):
+    """Codex + /review finding (PR #5, round 2): region_ready must flip to
+    True as soon as _set_region itself succeeds, not only after the whole
+    phrase (_collect_one) returns successfully. Otherwise a phrase that
+    applies the region fine but then fails later — e.g. on its last view,
+    the map tab where the region control is absent from the DOM — leaves
+    region_ready False, so the next phrase retries _set_region on a page
+    still parked on the map and gets InterfaceChangedError, cascading the
+    failure through the rest of the batch."""
+
+    _patch_common(monkeypatch)
+    set_region_calls = []
+
+    async def collect_one(
+        self, page, session, downloads_path, phrase, region, set_region=True, on_region_applied=None
+    ):
+        set_region_calls.append(set_region)
+        if set_region:
+            await self._set_region(page, region)
+            if on_region_applied is not None:
+                on_region_applied()
+        if phrase == "первый":
+            # Region was applied successfully above, but the phrase still
+            # fails afterwards (e.g. on its last view/report).
+            raise PhraseEntryError("boom after region confirmed")
+        return _fake_result(tmp_path, phrase)
+
+    monkeypatch.setattr(WordstatCollector, "_collect_one", collect_one)
+
+    collector = WordstatCollector("cdp", tmp_path)
+    batch = asyncio.run(collector.collect_many(["первый", "второй", "третий"]))
+
+    # Region was actually applied while handling "первый" — the second
+    # phrase must not try to re-select it (that would hit the map-tab
+    # InterfaceChangedError this test guards against).
+    assert set_region_calls == [True, False, False]
     assert [f.phrase for f in batch.failures] == ["первый"]
     assert [r.run_directory.name for r in batch.results] == ["второй", "третий"]
 

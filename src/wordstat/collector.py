@@ -4,6 +4,7 @@ import asyncio
 import json
 import tempfile
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -140,25 +141,38 @@ class WordstatCollector:
                 await self._wait_for(page, f"() => Boolean(document.querySelector({json.dumps(QUERY_SELECTOR)}))")
                 await self._assert_authenticated(page)
 
-                # Tracks whether some phrase has actually completed with the
-                # region applied — not just "was this the first phrase" by
-                # index. If phrase #1 fails before _set_region succeeds
-                # (_collect_one raises anywhere between entering the loop and
-                # the _set_region call), region_ready stays False and the
-                # next phrase retries it instead of the batch silently
-                # collecting the rest under whatever region the browser
-                # already had (Codex review finding, PR #5).
+                # Tracks whether the region has actually been applied in the
+                # browser — set by _collect_one's on_region_applied callback
+                # right after _set_region succeeds, not after the whole
+                # phrase (_collect_one) returns. A phrase can apply the
+                # region fine and then still fail later (e.g. on its last
+                # view, the map tab) — if region_ready were only set on a
+                # clean return, the next phrase would retry _set_region on a
+                # page already parked on the map, where the region control is
+                # absent from the DOM, and cascade InterfaceChangedError
+                # through the rest of the batch (Codex + /review finding,
+                # PR #5 round 2).
                 region_ready = False
+
+                def _mark_region_ready() -> None:
+                    nonlocal region_ready
+                    region_ready = True
+
                 for phrase in cleaned_phrases:
                     try:
-                        # set_region: only until some phrase confirms it —
-                        # see _collect_one for why the region control can't
-                        # be re-selected once a phrase's view loop has run
-                        # (and doesn't need to be after that).
+                        # set_region: only until region_ready flips — see
+                        # _collect_one for why the region control can't be
+                        # re-selected once a phrase's view loop has run (and
+                        # doesn't need to be after that).
                         result = await self._collect_one(
-                            page, session, downloads_path, phrase, region, set_region=not region_ready
+                            page,
+                            session,
+                            downloads_path,
+                            phrase,
+                            region,
+                            set_region=not region_ready,
+                            on_region_applied=_mark_region_ready,
                         )
-                        region_ready = True
                         results.append(result)
                     except AuthenticationRequiredError as error:
                         # The session itself is gone: every remaining phrase
@@ -193,6 +207,7 @@ class WordstatCollector:
         phrase: str,
         region: str,
         set_region: bool = True,
+        on_region_applied: Callable[[], None] | None = None,
     ) -> CollectionResult:
         # Checked once before the batch starts (collect_many), but a session
         # can lose authentication mid-batch (e.g. Yandex logs it out); check
@@ -213,18 +228,21 @@ class WordstatCollector:
         previous_table = await self._table_snapshot(page)
         await self._set_phrase(page, phrase)
         if set_region:
-            # Only until some phrase has completed with the region applied
-            # (collect_many tracks this via region_ready, not a plain "first
-            # phrase" index — a failure before this call succeeds must not
-            # permanently give up on setting the region for the rest of the
-            # batch). The region control lives on the table/graph/
-            # associations tabs but not on the map tab (WordstatView.REGIONS)
-            # — and every phrase's view loop ends on the map, so calling this
-            # again for a later phrase that already has it applied would fail
-            # with InterfaceChangedError (confirmed live). It also isn't
-            # needed again once applied: Wordstat keeps `region=` in the URL
-            # across a phrase switch without re-selecting it (confirmed live too).
+            # Only until region is actually applied — collect_many tracks
+            # that via on_region_applied, called right here, not by whether
+            # this whole method later returns successfully: a failure later
+            # in this same phrase (e.g. on its last view) must not make
+            # collect_many think the region still needs setting. The region
+            # control lives on the table/graph/associations tabs but not on
+            # the map tab (WordstatView.REGIONS) — and every phrase's view
+            # loop ends on the map, so calling this again for a later phrase
+            # that already has it applied would fail with
+            # InterfaceChangedError (confirmed live). It also isn't needed
+            # again once applied: Wordstat keeps `region=` in the URL across
+            # a phrase switch without re-selecting it (confirmed live too).
             await self._set_region(page, region)
+            if on_region_applied is not None:
+                on_region_applied()
         if previous_table is not None:
             await self._wait_for(
                 page,
