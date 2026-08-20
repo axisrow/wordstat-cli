@@ -13,7 +13,6 @@ from wordstat.csv_io import parse_wordstat_csv
 from wordstat.dataset_io import write_dataset
 from wordstat.errors import (
     AuthenticationRequiredError,
-    CsvFormatError,
     DownloadTimeoutError,
     InterfaceChangedError,
     InvalidRequestError,
@@ -67,6 +66,12 @@ class WordstatCollector:
         batch = await self.collect_many([phrase], region=region)
         if batch.failures:
             raise batch.failures[0].error
+        if not batch.results:
+            # Unreachable given a single input phrase (collect_many always
+            # returns exactly one result or one failure for it), but this
+            # keeps the contract from degrading into a bare IndexError if
+            # that ever changes.
+            raise InvalidRequestError("Collecting the phrase produced neither a result nor a failure")
         return batch.results[0]
 
     async def collect_many(self, phrases: list[str], region: str = "Россия") -> BatchCollectionResult:
@@ -106,8 +111,10 @@ class WordstatCollector:
         # downloads_path at construction time, but each phrase needs its own
         # run directory (built from its own slug). Downloads land in this
         # shared holding area and are moved into the per-phrase run directory
-        # as they are converted; nothing is left behind because
-        # finalize_raw/parquet writing always relocates or deletes the file.
+        # as they are converted; nothing is left behind in it once this `with`
+        # exits, because finalize_raw/parquet writing always relocates or
+        # deletes the file — and the failure path in _collect_one rescues it
+        # into the run directory first for any exception, not just success.
         with tempfile.TemporaryDirectory(dir=self.output_root, prefix=".downloads-") as downloads_dir:
             downloads_path = Path(downloads_dir)
             session = BrowserSession(
@@ -131,20 +138,27 @@ class WordstatCollector:
                     except AuthenticationRequiredError as error:
                         # The session itself is gone: every remaining phrase
                         # would fail the same way, so stop instead of piling
-                        # up identical failures.
+                        # up identical failures. Must be caught before the
+                        # generic Exception branch below.
                         failures.append(PhraseFailure(phrase=phrase, error=error))
                         break
-                    except (
-                        InterfaceChangedError,
-                        PhraseEntryError,
-                        DownloadTimeoutError,
-                        CsvFormatError,
-                    ) as error:
+                    except Exception as error:  # noqa: BLE001 - batch isolation is intentional
+                        # Anything else (InterfaceChangedError, a pyarrow
+                        # error from write_dataset, a dropped CDP connection
+                        # for this one phrase, ...) must not take down the
+                        # rest of the batch. BaseException (KeyboardInterrupt,
+                        # SystemExit) deliberately still propagates.
                         failures.append(PhraseFailure(phrase=phrase, error=error))
             finally:
-                await session.stop()
+                try:
+                    await session.stop()
+                except Exception:  # noqa: BLE001
+                    # A session.stop() failure (e.g. the CDP connection is
+                    # already gone) must not discard the results/failures
+                    # already collected below.
+                    pass
 
-        return BatchCollectionResult(results=results, failures=failures)
+        return BatchCollectionResult(total=len(cleaned_phrases), results=results, failures=failures)
 
     async def _collect_one(
         self,
@@ -154,14 +168,22 @@ class WordstatCollector:
         phrase: str,
         region: str,
     ) -> CollectionResult:
+        # Checked once before the batch starts (collect_many), but a session
+        # can lose authentication mid-batch (e.g. Yandex logs it out); check
+        # again per phrase so that loss surfaces as AuthenticationRequiredError
+        # instead of a confusing InterfaceChangedError from a control that
+        # silently stopped working.
+        await self._assert_authenticated(page)
+
         run_directory = create_run_directory(self.output_root, phrase)
         # In a batch, the previous phrase's table can still be sitting in the
         # DOM when _set_phrase's own waits (new `words=` in the URL, download
         # button present) are satisfied — those don't check the table itself.
-        # Snapshot it before switching phrases so we can confirm afterwards
-        # that Wordstat actually re-rendered for the new phrase, instead of
-        # silently downloading the previous phrase's data under this one's
-        # name.
+        # Snapshot it before switching phrases so we can give Wordstat a
+        # short extra moment to re-render for the new phrase. This is a best
+        # effort nudge, not a hard gate: two different (e.g. related) phrases
+        # can legally produce the same first row, or an empty table, so a
+        # timeout here must never fail the phrase — see _wait_for_briefly.
         previous_table = await self._table_snapshot(page)
         await self._set_phrase(page, phrase)
         # Re-applied per phrase: the control is idempotent (it only clicks
@@ -170,7 +192,7 @@ class WordstatCollector:
         # worse than the extra clicks.
         await self._set_region(page, region)
         if previous_table is not None:
-            await self._wait_for(
+            await self._wait_for_briefly(
                 page,
                 f"() => document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.textContent"
                 f" !== {json.dumps(previous_table)}",
@@ -181,19 +203,22 @@ class WordstatCollector:
             await self._select_view(page, selector)
             source = await self._download_current_view(page, session, downloads_path)
             try:
+                # Convert before disposing of the download, so a parse or
+                # write failure leaves the raw CSV on disk to inspect.
                 dataset = parse_wordstat_csv(source, view)
-            except CsvFormatError:
+                data_path, dtypes = write_dataset(dataset, run_directory)
+                raw_path = finalize_raw(source, run_directory, view, self.keep_raw)
+            except Exception:  # noqa: BLE001
                 # source lives in the batch's shared, temporary downloads
                 # directory; it would otherwise vanish with that directory
                 # once the batch finishes. Rescue it into this phrase's own
-                # run directory first, so "the CSV stays on disk to inspect"
-                # still holds for CsvFormatError, per CLAUDE.md.
-                source.replace(run_directory / source.name)
+                # run directory for any failure past this point (parsing,
+                # dtype inference, the parquet write itself), not just
+                # CsvFormatError, so "the CSV stays on disk to inspect" holds
+                # regardless of which step failed.
+                if source.exists():
+                    source.replace(run_directory / source.name)
                 raise
-            # Convert before disposing of the download, so a parse failure
-            # leaves the raw CSV on disk to inspect.
-            data_path, dtypes = write_dataset(dataset, run_directory)
-            raw_path = finalize_raw(source, run_directory, view, self.keep_raw)
             exports.append(
                 ExportSummary(
                     view=view,
@@ -404,6 +429,22 @@ class WordstatCollector:
                 return
             await asyncio.sleep(0.25)
         raise InterfaceChangedError(f"Wordstat did not reach the expected page state before the timeout: {expression}")
+
+    @staticmethod
+    async def _wait_for_briefly(page, expression: str, seconds: float = 3.0) -> None:
+        """Best-effort wait that gives up quietly instead of failing the phrase.
+
+        Used for signals that are a useful hint but not a reliable gate (see
+        the staleness nudge in _collect_one): two different phrases can
+        legally produce the same table content, so a timeout here must never
+        raise — it just means the nudge could not confirm anything either
+        way, and the caller proceeds regardless.
+        """
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if await page.evaluate(f"() => String(Boolean(({expression})()))") == "true":
+                return
+            await asyncio.sleep(0.25)
 
     @staticmethod
     def _resolved_file_snapshot(directory: Path, session: BrowserSession) -> dict[Path, Path]:

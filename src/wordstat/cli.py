@@ -11,6 +11,11 @@ from wordstat.errors import WordstatError
 
 _CONFIG = load_config()
 _DEFAULT_CDP_URL = _CONFIG.get("cdp_url", "http://127.0.0.1:9222")
+# Wordstat's native export encoding is cp1251; a phrases file typed or saved
+# on the same machine can plausibly be in either. Mirrors the encoding probe
+# in csv_io.py, minus utf-8-sig (a phrases file is authored by hand, not
+# exported by Wordstat, so a BOM is unlikely but harmless either way).
+_PHRASES_FILE_ENCODINGS = ("utf-8", "cp1251")
 
 
 @click.group()
@@ -29,9 +34,20 @@ def resolve_phrases(phrase_args: tuple[str, ...], phrases_file: Path | None) -> 
 
     phrases = list(phrase_args)
     if phrases_file is not None:
-        lines = phrases_file.read_text(encoding="utf-8").splitlines()
+        lines = _read_phrases_file(phrases_file).splitlines()
         phrases.extend(line for line in lines if line.strip())
     return phrases
+
+
+def _read_phrases_file(path: Path) -> str:
+    decode_errors: list[str] = []
+    for encoding in _PHRASES_FILE_ENCODINGS:
+        try:
+            return path.read_text(encoding=encoding)
+        except UnicodeDecodeError as error:
+            decode_errors.append(f"{encoding}: {error.reason}")
+    joined = "; ".join(decode_errors)
+    raise click.ClickException(f"Cannot decode --phrases-file {path.name} as UTF-8 or cp1251: {joined}")
 
 
 @main.command()
@@ -57,7 +73,9 @@ def resolve_phrases(phrase_args: tuple[str, ...], phrases_file: Path | None) -> 
     default=False,
     help="Keep each downloaded CSV as <view>.csv instead of discarding it after conversion.",
 )
+@click.pass_context
 def collect(
+    ctx: click.Context,
     phrase: tuple[str, ...],
     phrases_file: Path | None,
     region: str,
@@ -95,8 +113,18 @@ def collect(
     for failure in batch.failures:
         click.echo(f"{failure.phrase}: {failure.error}", err=True)
 
-    total = len(phrases)
-    collected = len(batch.results)
-    click.echo(f"Собрано {collected} из {total}", err=True)
+    attempted = len(batch.results) + len(batch.failures)
+    if attempted < batch.total:
+        # collect_many stopped early (a lost authentication makes the whole
+        # session unusable) — the remaining phrases were never attempted, so
+        # "Собрано N из M" would misleadingly read as "all the rest failed".
+        skipped = batch.total - attempted
+        click.echo(
+            f"Собрано {len(batch.results)} из {batch.total}"
+            f" (батч прерван, {skipped} фраз(ы) не пробовались)",
+            err=True,
+        )
+    else:
+        click.echo(f"Собрано {len(batch.results)} из {batch.total}", err=True)
     if batch.failures:
-        raise SystemExit(1)
+        ctx.exit(1)

@@ -85,10 +85,14 @@ class BatchCollectionResult(BaseModel):
 
     A phrase that failed is recorded in ``failures`` instead of aborting the
     whole batch (see :meth:`WordstatCollector.collect_many`), so ``results``
-    and ``failures`` together account for every requested phrase.
+    and ``failures`` together account for every requested phrase — unless the
+    batch was aborted early (e.g. a lost authentication), in which case
+    ``len(results) + len(failures) < total`` and the remaining phrases were
+    never attempted.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+    total: int
     results: list[CollectionResult]
     failures: list[PhraseFailure]
