@@ -19,7 +19,8 @@ def main() -> None:
 
 
 @main.command()
-@click.argument("phrase")
+@click.argument("phrases", nargs=-1)
+@click.option("--phrases-file", type=click.Path(path_type=Path, dir_okay=False), help="File with one phrase per line.")
 @click.option("--region", default="Россия", show_default=True, help="Exact region label in the Wordstat selector.")
 @click.option(
     "--output-dir",
@@ -35,8 +36,23 @@ def main() -> None:
     default=False,
     help="Keep each downloaded CSV as <view>.csv instead of discarding it after conversion.",
 )
-def collect(phrase: str, region: str, output_dir: Path, cdp_url: str, timeout_seconds: float, keep_raw: bool) -> None:
-    """Collect all MVP Wordstat reports for PHRASE as Parquet datasets."""
+def collect(
+    phrases: tuple[str, ...], phrases_file: Path | None, region: str, output_dir: Path,
+    cdp_url: str, timeout_seconds: float, keep_raw: bool,
+) -> None:
+    """Collect all MVP Wordstat reports for one or more PHRASES."""
+
+    file_phrases = []
+    if phrases_file:
+        try:
+            file_phrases = [
+                line.strip() for line in phrases_file.read_text(encoding="utf-8").splitlines() if line.strip()
+            ]
+        except OSError as error:
+            raise click.ClickException(f"Could not read phrases file: {error}") from error
+    requested = [*phrases, *file_phrases]
+    if not requested:
+        raise click.UsageError("Provide at least one PHRASE or --phrases-file")
 
     collector = WordstatCollector(
         cdp_url=cdp_url,
@@ -45,9 +61,15 @@ def collect(phrase: str, region: str, output_dir: Path, cdp_url: str, timeout_se
         keep_raw=keep_raw,
     )
     try:
-        result = asyncio.run(collector.collect(phrase=phrase, region=region))
+        result = asyncio.run(collector.collect_many(phrases=requested, region=region))
     # Only domain errors become friendly messages; an unexpected ValueError
     # from a dependency should keep its traceback instead of being reworded.
     except WordstatError as error:
         raise click.ClickException(str(error)) from error
-    click.echo(result.manifest_path)
+    for item in result.results:
+        click.echo(item.manifest_path)
+    click.echo(f"Collected {len(result.results)} of {result.total} phrases.")
+    for failure in result.failures:
+        click.echo(f"Failed: {failure.phrase or '<empty phrase>'}: {failure.error}", err=True)
+    if result.failures:
+        raise click.exceptions.Exit(1)
