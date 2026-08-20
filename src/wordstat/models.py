@@ -91,8 +91,6 @@ class BatchCollectionResult(BaseModel):
     never attempted.
     """
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
     total: int
     results: list[CollectionResult]
     failures: list[PhraseFailure]

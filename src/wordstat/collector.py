@@ -45,6 +45,18 @@ VIEW_SELECTORS = {
 }
 
 
+def _without_traceback(error: Exception) -> Exception:
+    """Drop the traceback before an exception is stashed in PhraseFailure.
+
+    Only the exception's type/message are ever read back out (collect()'s
+    re-raise, the CLI's error line); the traceback would otherwise keep every
+    frame on the stack alive — page, session, a parsed CsvDataset, ... — for
+    as long as the batch's failures list is (until collect_many returns and
+    the CLI finishes printing it).
+    """
+    return error.with_traceback(None)
+
+
 class WordstatCollector:
     """Export four Wordstat reports through an already authenticated CDP session."""
 
@@ -90,12 +102,9 @@ class WordstatCollector:
         if not region:
             raise InvalidRequestError("The region must not be empty")
 
-        cleaned_phrases = []
-        for phrase in phrases:
-            phrase = phrase.strip()
-            if not phrase:
-                raise InvalidRequestError("The search phrase must not be empty")
-            cleaned_phrases.append(phrase)
+        cleaned_phrases = [phrase.strip() for phrase in phrases]
+        if not all(cleaned_phrases):
+            raise InvalidRequestError("The search phrase must not be empty")
 
         results: list[CollectionResult] = []
         failures: list[PhraseFailure] = []
@@ -133,15 +142,9 @@ class WordstatCollector:
 
                 for index, phrase in enumerate(cleaned_phrases):
                     try:
-                        # The region control (.settings__selected button) is
-                        # only present on the table/graph/associations tabs,
-                        # not on the map (WordstatView.REGIONS) tab — and
-                        # every phrase's view loop ends on the map. Calling
-                        # _set_region again for phrase #2+ would hit that tab
-                        # and raise InterfaceChangedError. It also isn't
-                        # needed: confirmed on a live session that Wordstat
-                        # keeps `region=` in the URL across a phrase switch
-                        # without re-selecting it.
+                        # set_region: only the first phrase — see _collect_one
+                        # for why the region control can't be re-selected for
+                        # later phrases (and doesn't need to be).
                         result = await self._collect_one(
                             page, session, downloads_path, phrase, region, set_region=index == 0
                         )
@@ -151,7 +154,7 @@ class WordstatCollector:
                         # would fail the same way, so stop instead of piling
                         # up identical failures. Must be caught before the
                         # generic Exception branch below.
-                        failures.append(PhraseFailure(phrase=phrase, error=error))
+                        failures.append(PhraseFailure(phrase=phrase, error=_without_traceback(error)))
                         break
                     except Exception as error:  # noqa: BLE001 - batch isolation is intentional
                         # Anything else (InterfaceChangedError, a pyarrow
@@ -159,7 +162,7 @@ class WordstatCollector:
                         # for this one phrase, ...) must not take down the
                         # rest of the batch. BaseException (KeyboardInterrupt,
                         # SystemExit) deliberately still propagates.
-                        failures.append(PhraseFailure(phrase=phrase, error=error))
+                        failures.append(PhraseFailure(phrase=phrase, error=_without_traceback(error)))
             finally:
                 try:
                     await session.stop()
@@ -195,7 +198,7 @@ class WordstatCollector:
         # short extra moment to re-render for the new phrase. This is a best
         # effort nudge, not a hard gate: two different (e.g. related) phrases
         # can legally produce the same first row, or an empty table, so a
-        # timeout here must never fail the phrase — see _wait_for_briefly.
+        # timeout here must never fail the phrase — see _wait_for(required=False).
         previous_table = await self._table_snapshot(page)
         await self._set_phrase(page, phrase)
         if set_region:
@@ -208,10 +211,12 @@ class WordstatCollector:
             # phrase switch without re-selecting it (confirmed live too).
             await self._set_region(page, region)
         if previous_table is not None:
-            await self._wait_for_briefly(
+            await self._wait_for(
                 page,
                 f"() => document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.textContent"
                 f" !== {json.dumps(previous_table)}",
+                seconds=3.0,
+                required=False,
             )
 
         exports = []
@@ -438,29 +443,25 @@ class WordstatCollector:
         if json.loads(result) != {"count": 1}:
             raise InterfaceChangedError(f"Wordstat control {text!r} was not uniquely found")
 
-    async def _wait_for(self, page, expression: str) -> None:
-        deadline = time.monotonic() + self.timeout_seconds
-        while time.monotonic() < deadline:
-            if await page.evaluate(f"() => String(Boolean(({expression})()))") == "true":
-                return
-            await asyncio.sleep(0.25)
-        raise InterfaceChangedError(f"Wordstat did not reach the expected page state before the timeout: {expression}")
+    async def _wait_for(self, page, expression: str, seconds: float | None = None, required: bool = True) -> None:
+        """Poll `expression` until it's true, or give up after the deadline.
 
-    @staticmethod
-    async def _wait_for_briefly(page, expression: str, seconds: float = 3.0) -> None:
-        """Best-effort wait that gives up quietly instead of failing the phrase.
-
-        Used for signals that are a useful hint but not a reliable gate (see
-        the staleness nudge in _collect_one): two different phrases can
-        legally produce the same table content, so a timeout here must never
-        raise — it just means the nudge could not confirm anything either
-        way, and the caller proceeds regardless.
+        `required=False` (used for the staleness nudge in _collect_one) makes
+        the timeout a no-op instead of a failure: two different phrases can
+        legally produce the same table content, so that signal is a useful
+        hint but not a reliable gate — a timeout there just means the nudge
+        could not confirm anything either way, and the caller proceeds
+        regardless.
         """
-        deadline = time.monotonic() + seconds
+        deadline = time.monotonic() + (seconds if seconds is not None else self.timeout_seconds)
         while time.monotonic() < deadline:
             if await page.evaluate(f"() => String(Boolean(({expression})()))") == "true":
                 return
             await asyncio.sleep(0.25)
+        if required:
+            raise InterfaceChangedError(
+                f"Wordstat did not reach the expected page state before the timeout: {expression}"
+            )
 
     @staticmethod
     def _resolved_file_snapshot(directory: Path, session: BrowserSession) -> dict[Path, Path]:

@@ -40,10 +40,11 @@ def resolve_phrases(phrase_args: tuple[str, ...], phrases_file: Path | None) -> 
 
 
 def _read_phrases_file(path: Path) -> str:
+    data = path.read_bytes()
     decode_errors: list[str] = []
     for encoding in _PHRASES_FILE_ENCODINGS:
         try:
-            return path.read_text(encoding=encoding)
+            return data.decode(encoding)
         except UnicodeDecodeError as error:
             decode_errors.append(f"{encoding}: {error.reason}")
     joined = "; ".join(decode_errors)
@@ -113,18 +114,12 @@ def collect(
     for failure in batch.failures:
         click.echo(f"{failure.phrase}: {failure.error}", err=True)
 
-    attempted = len(batch.results) + len(batch.failures)
-    if attempted < batch.total:
-        # collect_many stopped early (a lost authentication makes the whole
-        # session unusable) — the remaining phrases were never attempted, so
-        # "Собрано N из M" would misleadingly read as "all the rest failed".
-        skipped = batch.total - attempted
-        click.echo(
-            f"Собрано {len(batch.results)} из {batch.total}"
-            f" (батч прерван, {skipped} фраз(ы) не пробовались)",
-            err=True,
-        )
-    else:
-        click.echo(f"Собрано {len(batch.results)} из {batch.total}", err=True)
+    skipped = batch.total - len(batch.results) - len(batch.failures)
+    # collect_many stopped early when skipped > 0 (a lost authentication makes
+    # the whole session unusable) — the remaining phrases were never
+    # attempted, so "Собрано N из M" alone would misleadingly read as "all the
+    # rest failed".
+    suffix = f" (батч прерван, {skipped} фраз(ы) не пробовались)" if skipped else ""
+    click.echo(f"Собрано {len(batch.results)} из {batch.total}{suffix}", err=True)
     if batch.failures:
         ctx.exit(1)

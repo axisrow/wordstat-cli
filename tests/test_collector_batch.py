@@ -65,7 +65,6 @@ def _patch_common(monkeypatch):
     _FakeSession.instances = 0
     monkeypatch.setattr(collector_module, "BrowserSession", _FakeSession)
     monkeypatch.setattr(WordstatCollector, "_wait_for", _noop)
-    monkeypatch.setattr(WordstatCollector, "_wait_for_briefly", _noop)
     monkeypatch.setattr(WordstatCollector, "_assert_authenticated", _noop)
     monkeypatch.setattr(WordstatCollector, "_set_phrase", _noop)
     monkeypatch.setattr(WordstatCollector, "_set_region", _noop)
