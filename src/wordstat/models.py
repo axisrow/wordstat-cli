@@ -17,7 +17,11 @@ class WordstatView(StrEnum):
 
 
 class CsvDataset(BaseModel):
-    """A parsed CSV export with headers preserved exactly as Wordstat provided them."""
+    """A parsed CSV export with headers preserved exactly as Wordstat provided them.
+
+    Values stay as text here; column typing happens on the way to Parquet
+    (see :mod:`wordstat.dtypes`).
+    """
 
     view: WordstatView
     source_file: Path
@@ -26,17 +30,23 @@ class CsvDataset(BaseModel):
 
 
 class ExportSummary(BaseModel):
-    """Small manifest entry for one validated CSV export."""
+    """Small manifest entry for one converted report.
+
+    ``raw_file`` names the original download, which is removed unless the run
+    was asked to keep it.  ``dtypes`` records the inferred column types so an
+    unexpected export format is visible in the manifest.
+    """
 
     view: WordstatView
     file: str
-    source_file: str
+    raw_file: str | None
     row_count: int
     headers: list[str]
+    dtypes: dict[str, str]
 
 
 class CollectionManifest(BaseModel):
-    """Reproducibility metadata written beside the downloaded CSV files."""
+    """Reproducibility metadata written beside the converted Parquet files."""
 
     phrase: str
     region: str

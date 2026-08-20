@@ -2,7 +2,6 @@
 
 import json
 import re
-import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -31,12 +30,19 @@ def slugify(value: str) -> str:
     return compact[:64] or "query"
 
 
-def preserve_export(source: Path, run_directory: Path, view: WordstatView) -> Path:
-    """Copy a downloaded CSV to the view's canonical name and keep the source file."""
+def finalize_raw(source: Path, run_directory: Path, view: WordstatView, keep_raw: bool) -> Path | None:
+    """Dispose of a download once it has been converted to Parquet.
 
+    By default the raw CSV is removed, leaving only the converted datasets in
+    the run directory.  With ``keep_raw`` it is renamed to the view's canonical
+    name so it sits next to its ``<view>.parquet`` counterpart.
+    """
+
+    if not keep_raw:
+        source.unlink(missing_ok=True)
+        return None
     destination = run_directory / f"{view.value}.csv"
-    shutil.copy2(source, destination)
-    return destination
+    return source.replace(destination)
 
 
 def write_manifest(path: Path, manifest: CollectionManifest) -> None:

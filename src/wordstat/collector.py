@@ -9,6 +9,7 @@ from pathlib import Path
 from browser_use.browser import BrowserSession
 
 from wordstat.csv_io import parse_wordstat_csv
+from wordstat.dataset_io import write_dataset
 from wordstat.errors import (
     AuthenticationRequiredError,
     DownloadTimeoutError,
@@ -16,7 +17,7 @@ from wordstat.errors import (
     PhraseEntryError,
 )
 from wordstat.models import CollectionManifest, CollectionResult, ExportSummary, WordstatView
-from wordstat.storage import create_run_directory, preserve_export, write_manifest
+from wordstat.storage import create_run_directory, finalize_raw, write_manifest
 
 WORDSTAT_URL = "https://wordstat.yandex.ru/"
 QUERY_SELECTOR = 'input[placeholder="Введите слово или словосочетание"]'
@@ -30,13 +31,20 @@ TABLE_ROW_SELECTOR = ".table__wrapper tbody tr"
 class WordstatCollector:
     """Export four Wordstat reports through an already authenticated CDP session."""
 
-    def __init__(self, cdp_url: str, output_root: Path, timeout_seconds: float = 45.0) -> None:
+    def __init__(
+        self,
+        cdp_url: str,
+        output_root: Path,
+        timeout_seconds: float = 45.0,
+        keep_raw: bool = False,
+    ) -> None:
         self.cdp_url = cdp_url
         self.output_root = output_root
         self.timeout_seconds = timeout_seconds
+        self.keep_raw = keep_raw
 
     async def collect(self, phrase: str, region: str = "Россия") -> CollectionResult:
-        """Collect popular, related, dynamics and regional CSV reports for one phrase."""
+        """Collect popular, related, dynamics and regional reports for one phrase."""
 
         phrase = phrase.strip()
         region = region.strip()
@@ -63,7 +71,7 @@ class WordstatCollector:
             await self._set_region(page, region)
 
             datasets = []
-            original_downloads = []
+            exports = []
             for view, selector in (
                 (WordstatView.TOP_POPULAR, "label[for='table']"),
                 (WordstatView.TOP_RELATED, "label:has(#associations)"),
@@ -72,25 +80,31 @@ class WordstatCollector:
             ):
                 await self._select_view(page, selector)
                 source = await self._download_current_view(page, session, run_directory)
-                destination = preserve_export(source, run_directory, view)
-                original_downloads.append(source)
-                datasets.append(parse_wordstat_csv(destination, view))
+                dataset = parse_wordstat_csv(source, view)
+                # Convert before disposing of the download, so a parse failure
+                # leaves the raw CSV on disk to inspect.
+                data_path, dtypes = write_dataset(dataset, run_directory)
+                raw_path = finalize_raw(source, run_directory, view, self.keep_raw)
+                # The download is normally gone by now; point the dataset at
+                # the file that actually survives the run.
+                datasets.append(dataset.model_copy(update={"source_file": data_path}))
+                exports.append(
+                    ExportSummary(
+                        view=view,
+                        file=data_path.name,
+                        raw_file=raw_path.name if raw_path else None,
+                        row_count=len(dataset.rows),
+                        headers=dataset.headers,
+                        dtypes=dtypes,
+                    )
+                )
 
             manifest = CollectionManifest(
                 phrase=phrase,
                 region=region,
                 created_at=datetime.now(UTC),
                 source_url=await page.get_url(),
-                exports=[
-                    ExportSummary(
-                        view=dataset.view,
-                        file=dataset.source_file.name,
-                        source_file=source.name,
-                        row_count=len(dataset.rows),
-                        headers=dataset.headers,
-                    )
-                    for dataset, source in zip(datasets, original_downloads, strict=True)
-                ],
+                exports=exports,
             )
             manifest_path = run_directory / "manifest.json"
             write_manifest(manifest_path, manifest)

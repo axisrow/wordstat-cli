@@ -15,7 +15,7 @@ _DEFAULT_CDP_URL = _CONFIG.get("cdp_url", "http://127.0.0.1:9222")
 
 @click.group()
 def main() -> None:
-    """Collect validated CSV reports from Yandex Wordstat."""
+    """Collect validated Yandex Wordstat reports as Parquet datasets."""
 
 
 @main.command()
@@ -29,10 +29,21 @@ def main() -> None:
 )
 @click.option("--cdp-url", envvar="WORDSTAT_CDP_URL", default=_DEFAULT_CDP_URL, show_default=True)
 @click.option("--timeout", "timeout_seconds", type=click.FloatRange(min=1), default=45.0, show_default=True)
-def collect(phrase: str, region: str, output_dir: Path, cdp_url: str, timeout_seconds: float) -> None:
-    """Download all MVP Wordstat reports for PHRASE."""
+@click.option(
+    "--keep-raw",
+    is_flag=True,
+    default=False,
+    help="Keep each downloaded CSV as <view>.csv instead of discarding it after conversion.",
+)
+def collect(phrase: str, region: str, output_dir: Path, cdp_url: str, timeout_seconds: float, keep_raw: bool) -> None:
+    """Collect all MVP Wordstat reports for PHRASE as Parquet datasets."""
 
-    collector = WordstatCollector(cdp_url=cdp_url, output_root=output_dir, timeout_seconds=timeout_seconds)
+    collector = WordstatCollector(
+        cdp_url=cdp_url,
+        output_root=output_dir,
+        timeout_seconds=timeout_seconds,
+        keep_raw=keep_raw,
+    )
     try:
         result = asyncio.run(collector.collect(phrase=phrase, region=region))
     except (ValueError, WordstatError) as error:
