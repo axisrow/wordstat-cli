@@ -3,7 +3,7 @@ name = "wordstat"
 version = "0.1.0"
 description = "Export and validate Yandex Wordstat CSV reports through an existing Chrome session"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.13"
 dependencies = [
     "browser-use",
     "click>=8.1",
@@ -28,6 +28,7 @@ testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 120
+target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
