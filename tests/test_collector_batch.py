@@ -214,6 +214,34 @@ def test_collect_many_only_sets_region_for_the_first_phrase(monkeypatch, tmp_pat
     assert set_region_calls == [True, False, False]
 
 
+def test_collect_many_retries_region_after_the_first_phrase_fails(monkeypatch, tmp_path):
+    """Codex review finding (PR #5): set_region was computed as index == 0
+    against the original phrase list, so a failure on phrase #1 before
+    _set_region succeeded left region unset for the rest of the batch —
+    every remaining phrase silently collected with whatever region the
+    browser already had, while the manifest kept claiming the requested
+    region. Region must be retried until a phrase actually completes with
+    it applied, not permanently given up on after the first attempt."""
+
+    _patch_common(monkeypatch)
+    set_region_calls = []
+
+    async def recording_collect_one(self, page, session, downloads_path, phrase, region, set_region=True):
+        set_region_calls.append(set_region)
+        if phrase == "первый":
+            raise PhraseEntryError("boom before region confirmed")
+        return _fake_result(tmp_path, phrase)
+
+    monkeypatch.setattr(WordstatCollector, "_collect_one", recording_collect_one)
+
+    collector = WordstatCollector("cdp", tmp_path)
+    batch = asyncio.run(collector.collect_many(["первый", "второй", "третий"]))
+
+    assert set_region_calls == [True, True, False]
+    assert [f.phrase for f in batch.failures] == ["первый"]
+    assert [r.run_directory.name for r in batch.results] == ["второй", "третий"]
+
+
 def test_collect_many_keeps_results_when_session_stop_raises(monkeypatch, tmp_path):
     """session.stop() failing (e.g. a dropped CDP connection) must not
     discard results/failures already collected."""

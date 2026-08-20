@@ -140,14 +140,25 @@ class WordstatCollector:
                 await self._wait_for(page, f"() => Boolean(document.querySelector({json.dumps(QUERY_SELECTOR)}))")
                 await self._assert_authenticated(page)
 
-                for index, phrase in enumerate(cleaned_phrases):
+                # Tracks whether some phrase has actually completed with the
+                # region applied — not just "was this the first phrase" by
+                # index. If phrase #1 fails before _set_region succeeds
+                # (_collect_one raises anywhere between entering the loop and
+                # the _set_region call), region_ready stays False and the
+                # next phrase retries it instead of the batch silently
+                # collecting the rest under whatever region the browser
+                # already had (Codex review finding, PR #5).
+                region_ready = False
+                for phrase in cleaned_phrases:
                     try:
-                        # set_region: only the first phrase — see _collect_one
-                        # for why the region control can't be re-selected for
-                        # later phrases (and doesn't need to be).
+                        # set_region: only until some phrase confirms it —
+                        # see _collect_one for why the region control can't
+                        # be re-selected once a phrase's view loop has run
+                        # (and doesn't need to be after that).
                         result = await self._collect_one(
-                            page, session, downloads_path, phrase, region, set_region=index == 0
+                            page, session, downloads_path, phrase, region, set_region=not region_ready
                         )
+                        region_ready = True
                         results.append(result)
                     except AuthenticationRequiredError as error:
                         # The session itself is gone: every remaining phrase
@@ -202,13 +213,17 @@ class WordstatCollector:
         previous_table = await self._table_snapshot(page)
         await self._set_phrase(page, phrase)
         if set_region:
-            # Only for the first phrase of a batch. The region control lives
-            # on the table/graph/associations tabs but not on the map tab
-            # (WordstatView.REGIONS) — and every phrase's view loop ends on
-            # the map, so calling this again for a later phrase would fail
+            # Only until some phrase has completed with the region applied
+            # (collect_many tracks this via region_ready, not a plain "first
+            # phrase" index — a failure before this call succeeds must not
+            # permanently give up on setting the region for the rest of the
+            # batch). The region control lives on the table/graph/
+            # associations tabs but not on the map tab (WordstatView.REGIONS)
+            # — and every phrase's view loop ends on the map, so calling this
+            # again for a later phrase that already has it applied would fail
             # with InterfaceChangedError (confirmed live). It also isn't
-            # needed again: Wordstat keeps `region=` in the URL across a
-            # phrase switch without re-selecting it (confirmed live too).
+            # needed again once applied: Wordstat keeps `region=` in the URL
+            # across a phrase switch without re-selecting it (confirmed live too).
             await self._set_region(page, region)
         if previous_table is not None:
             await self._wait_for(
