@@ -17,8 +17,11 @@ from __future__ import annotations
 import re
 from types import NotImplementedType
 
-# Wordstat separates thousands with several different space characters.
-_SPACES = (" ", " ", " ", " ", " ")
+# Wordstat separates thousands with a space, but not always the same one:
+# U+00A0, U+202F, U+2009 and U+2007 all appear.  Strip whitespace as a rule
+# rather than enumerating the variants seen so far — a missed variant would
+# silently degrade the whole column to text.
+_WHITESPACE = re.compile(r"\s")
 
 # Deliberately strict.  ``int()``/``float()`` would accept values that are not
 # numbers in this data: "01.2024" (a dynamics period) parses as 1.2024,
@@ -35,10 +38,8 @@ def parse_number(value: str) -> int | float | None | NotImplementedType:
     ``NotImplemented`` when the value is not a number at all.
     """
 
-    compact = value
-    for space in _SPACES:
-        compact = compact.replace(space, "")
-    if not compact.strip():
+    compact = _WHITESPACE.sub("", value)
+    if not compact:
         return None
     if not _NUMERIC.match(compact):
         return NotImplemented

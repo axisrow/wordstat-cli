@@ -10,8 +10,6 @@ import pyarrow.parquet as pq
 from wordstat.dtypes import infer_column
 from wordstat.models import CsvDataset
 
-_ARROW_TYPES = {"int64": pa.int64(), "float64": pa.float64()}
-
 
 def write_dataset(dataset: CsvDataset, run_directory: Path) -> tuple[Path, dict[str, str]]:
     """Write one report as ``<view>.parquet`` and report the inferred column types.
@@ -32,7 +30,7 @@ def write_dataset(dataset: CsvDataset, run_directory: Path) -> tuple[Path, dict[
         else:
             dtype, coerced = inferred
             dtypes[header] = dtype
-            columns[header] = pa.array(coerced, type=_ARROW_TYPES[dtype])
+            columns[header] = pa.array(coerced, type=pa.type_for_alias(dtype))
 
     table = pa.table(columns)
     destination = run_directory / f"{dataset.view.value}.parquet"

@@ -14,6 +14,7 @@ from wordstat.errors import (
     AuthenticationRequiredError,
     DownloadTimeoutError,
     InterfaceChangedError,
+    InvalidRequestError,
     PhraseEntryError,
 )
 from wordstat.models import CollectionManifest, CollectionResult, ExportSummary, WordstatView
@@ -26,6 +27,14 @@ DOWNLOAD_SELECTOR = "button.save-button"
 DOWNLOAD_CSV_MENU_ITEM_SELECTOR = "a[download]:has(button.save-csv-button)"
 REGION_BUTTON_SELECTOR = ".settings__selected button"
 TABLE_ROW_SELECTOR = ".table__wrapper tbody tr"
+# Tab selectors live here with the rest of the DOM knowledge; the markup is
+# inconsistent enough (id- vs for-based) that it is worth having in one place.
+VIEW_SELECTORS = {
+    WordstatView.TOP_POPULAR: "label[for='table']",
+    WordstatView.TOP_RELATED: "label:has(#associations)",
+    WordstatView.DYNAMICS: "label[for='graph']",
+    WordstatView.REGIONS: "label[for='map']",
+}
 
 
 class WordstatCollector:
@@ -49,9 +58,9 @@ class WordstatCollector:
         phrase = phrase.strip()
         region = region.strip()
         if not phrase:
-            raise ValueError("The search phrase must not be empty")
+            raise InvalidRequestError("The search phrase must not be empty")
         if not region:
-            raise ValueError("The region must not be empty")
+            raise InvalidRequestError("The region must not be empty")
 
         run_directory = create_run_directory(self.output_root, phrase)
         session = BrowserSession(
@@ -70,14 +79,8 @@ class WordstatCollector:
             await self._set_phrase(page, phrase)
             await self._set_region(page, region)
 
-            datasets = []
             exports = []
-            for view, selector in (
-                (WordstatView.TOP_POPULAR, "label[for='table']"),
-                (WordstatView.TOP_RELATED, "label:has(#associations)"),
-                (WordstatView.DYNAMICS, "label[for='graph']"),
-                (WordstatView.REGIONS, "label[for='map']"),
-            ):
+            for view, selector in VIEW_SELECTORS.items():
                 await self._select_view(page, selector)
                 source = await self._download_current_view(page, session, run_directory)
                 dataset = parse_wordstat_csv(source, view)
@@ -85,16 +88,12 @@ class WordstatCollector:
                 # leaves the raw CSV on disk to inspect.
                 data_path, dtypes = write_dataset(dataset, run_directory)
                 raw_path = finalize_raw(source, run_directory, view, self.keep_raw)
-                # The download is normally gone by now; point the dataset at
-                # the file that actually survives the run.
-                datasets.append(dataset.model_copy(update={"source_file": data_path}))
                 exports.append(
                     ExportSummary(
                         view=view,
                         file=data_path.name,
                         raw_file=raw_path.name if raw_path else None,
                         row_count=len(dataset.rows),
-                        headers=dataset.headers,
                         dtypes=dtypes,
                     )
                 )
@@ -112,7 +111,6 @@ class WordstatCollector:
                 run_directory=run_directory,
                 manifest_path=manifest_path,
                 manifest=manifest,
-                datasets=datasets,
             )
         finally:
             await session.stop()

@@ -1,6 +1,5 @@
 """Run-directory and manifest handling."""
 
-import json
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -48,5 +47,6 @@ def finalize_raw(source: Path, run_directory: Path, view: WordstatView, keep_raw
 def write_manifest(path: Path, manifest: CollectionManifest) -> None:
     """Write reproducibility metadata in stable UTF-8 JSON."""
 
-    payload = json.loads(manifest.model_dump_json())
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # pydantic emits UTF-8 without escaping non-ASCII, so the Cyrillic stays
+    # readable without a round-trip through the json module.
+    path.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")

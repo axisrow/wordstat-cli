@@ -32,7 +32,6 @@ def test_write_manifest_preserves_cyrillic_metadata(tmp_path: Path) -> None:
                 file="top_popular.parquet",
                 raw_file=None,
                 row_count=1,
-                headers=["Запрос"],
                 dtypes={"Запрос": "string"},
             )
         ],

@@ -24,7 +24,6 @@ class CsvDataset(BaseModel):
     """
 
     view: WordstatView
-    source_file: Path
     headers: list[str] = Field(min_length=1)
     rows: list[dict[str, str]]
 
@@ -34,14 +33,15 @@ class ExportSummary(BaseModel):
 
     ``raw_file`` names the original download, which is removed unless the run
     was asked to keep it.  ``dtypes`` records the inferred column types so an
-    unexpected export format is visible in the manifest.
+    unexpected export format is visible in the manifest; it is keyed by the
+    localized column names in their original order, so it doubles as the
+    header list.
     """
 
     view: WordstatView
     file: str
     raw_file: str | None
     row_count: int
-    headers: list[str]
     dtypes: dict[str, str]
 
 
@@ -56,9 +56,12 @@ class CollectionManifest(BaseModel):
 
 
 class CollectionResult(BaseModel):
-    """In-memory result returned by :class:`WordstatCollector`."""
+    """In-memory result returned by :class:`WordstatCollector`.
+
+    The parsed rows are deliberately not carried here: they are already on disk
+    as Parquet, and the manifest describes every export.
+    """
 
     run_directory: Path
     manifest_path: Path
     manifest: CollectionManifest
-    datasets: list[CsvDataset]

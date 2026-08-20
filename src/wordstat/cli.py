@@ -46,6 +46,8 @@ def collect(phrase: str, region: str, output_dir: Path, cdp_url: str, timeout_se
     )
     try:
         result = asyncio.run(collector.collect(phrase=phrase, region=region))
-    except (ValueError, WordstatError) as error:
+    # Only domain errors become friendly messages; an unexpected ValueError
+    # from a dependency should keep its traceback instead of being reworded.
+    except WordstatError as error:
         raise click.ClickException(str(error)) from error
     click.echo(result.manifest_path)

@@ -1,7 +1,5 @@
 """Parquet writing for parsed Wordstat exports."""
 
-from pathlib import Path
-
 import pyarrow.parquet as pq
 
 from wordstat.dataset_io import write_dataset
@@ -9,7 +7,7 @@ from wordstat.models import CsvDataset, WordstatView
 
 
 def _dataset(headers, rows, view=WordstatView.TOP_POPULAR):
-    return CsvDataset(view=view, source_file=Path("ignored.csv"), headers=headers, rows=rows)
+    return CsvDataset(view=view, headers=headers, rows=rows)
 
 
 def test_write_dataset_types_numeric_columns_and_keeps_text(tmp_path):

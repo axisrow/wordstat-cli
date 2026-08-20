@@ -5,6 +5,10 @@ class WordstatError(RuntimeError):
     """Base class for a failed Wordstat collection."""
 
 
+class InvalidRequestError(WordstatError):
+    """The requested phrase or region is unusable before the browser is touched."""
+
+
 class AuthenticationRequiredError(WordstatError):
     """Wordstat is reachable but the attached browser is not authenticated."""
 

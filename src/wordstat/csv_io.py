@@ -25,7 +25,7 @@ def parse_wordstat_csv(path: Path, view: WordstatView) -> CsvDataset:
     headers = _validate_headers(raw_headers, path)
     rows = [_normalise_row(row, raw_headers, headers) for row in reader]
     rows = [row for row in rows if any(value.strip() for value in row.values())]
-    return CsvDataset(view=view, source_file=path, headers=headers, rows=rows)
+    return CsvDataset(view=view, headers=headers, rows=rows)
 
 
 def _read_text(path: Path) -> str:

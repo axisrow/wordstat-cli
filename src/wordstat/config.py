@@ -25,7 +25,7 @@ def _config_search_paths() -> list[Path]:
 
     return [
         Path.cwd() / CONFIG_FILENAME,
-        Path(__file__).resolve().parent.parent.parent / CONFIG_FILENAME,
+        Path(__file__).resolve().parents[2] / CONFIG_FILENAME,
     ]
 
 
