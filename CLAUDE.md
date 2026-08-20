@@ -16,7 +16,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Setup
 
 ```bash
-cd /Users/axisrow/Projects/wordstat
+cd wordstat-cli
 uv venv --python 3.11
 source .venv/bin/activate
 uv sync --all-groups

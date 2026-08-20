@@ -42,7 +42,7 @@ SEO-тулинг сюда не входят.
 
 | Проект | Язык | ★ | Доступ | Что нужно | Отчёты | Выход |
 |---|---|---|---|---|---|---|
-| **[axisrow/wordstat](https://github.com/axisrow/wordstat)** (этот) | Python | — | CDP к уже открытому Chrome | авторизованный Chrome | 4 вида: популярные, похожие, динамика, регионы | типизированный Parquet + `manifest.json` |
+| **[axisrow/wordstat-cli](https://github.com/axisrow/wordstat-cli)** (этот) | Python | — | CDP к уже открытому Chrome | авторизованный Chrome | 4 вида: популярные, похожие, динамика, регионы | типизированный Parquet + `manifest.json` |
 | [sophiaelowyn/yandex-wordstat-parser](https://github.com/sophiaelowyn/yandex-wordstat-parser) | Python | 3 | CDP `:9222` | Chrome + логин | популярные, похожие, динамика | JSON |
 | [DiFlector/Wordstat-parser](https://github.com/DiFlector/Wordstat-parser) | Python | 7 | Selenium | chromedriver/geckodriver | частотность в 3 формах: базовая, точная, уточнённая | XLSX |
 | [Fauros/yandex-wordstat-parser](https://github.com/Fauros/yandex-wordstat-parser) | Jupyter | 0 | свой браузер | интерактивный логин по ходу работы | динамика за 24 мес. | CSV на каждый ключ |
@@ -66,7 +66,7 @@ SEO-тулинг сюда не входят.
 
 | Проект | Лицензия | Тесты | Последний push |
 |---|---|---|---|
-| axisrow/wordstat | MIT | да (`tests/`, 5 файлов) | 2026-08 |
+| axisrow/wordstat-cli | MIT | да (`tests/`, 5 файлов) | 2026-08 |
 | sophiaelowyn/yandex-wordstat-parser | MIT | нет | 2026-08 |
 | DiFlector/Wordstat-parser | нет | нет | 2025-09 |
 | Fauros/yandex-wordstat-parser | нет | нет | 2026-06 |
