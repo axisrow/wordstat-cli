@@ -42,7 +42,7 @@ def _read_text(path: Path) -> str:
 def _detect_dialect(text: str) -> csv.Dialect:
     sample = text[:4096]
     try:
-        return csv.Sniffer().sniff(sample, delimiters=";,\\t")
+        return csv.Sniffer().sniff(sample, delimiters=";,\t")
     except csv.Error:
         return csv.excel
 
