@@ -73,7 +73,7 @@ def _patch_common(monkeypatch):
 
 
 def _patch_collect_one(monkeypatch, behavior):
-    async def fake_collect_one(self, page, session, downloads_path, phrase, region):
+    async def fake_collect_one(self, page, session, downloads_path, phrase, region, set_region=True):
         return await behavior(phrase)
 
     monkeypatch.setattr(WordstatCollector, "_collect_one", fake_collect_one)
@@ -141,7 +141,7 @@ def test_collect_many_aborts_on_lost_authentication_without_trying_the_rest(monk
     _patch_common(monkeypatch)
     attempted = []
 
-    async def collect_one(self, page, session, downloads_path, phrase, region):
+    async def collect_one(self, page, session, downloads_path, phrase, region, set_region=True):
         attempted.append(phrase)
         if phrase == "второй":
             raise AuthenticationRequiredError("session lost")
@@ -185,11 +185,34 @@ def _patch_collect_one_passthrough(monkeypatch, tmp_path):
     """Let _collect_one call the real _assert_authenticated, then
     short-circuit the rest of the browser interaction."""
 
-    async def passthrough(self, page, session, downloads_path, phrase, region):
+    async def passthrough(self, page, session, downloads_path, phrase, region, set_region=True):
         await self._assert_authenticated(page)
         return _fake_result(tmp_path, phrase)
 
     monkeypatch.setattr(WordstatCollector, "_collect_one", passthrough)
+
+
+def test_collect_many_only_sets_region_for_the_first_phrase(monkeypatch, tmp_path):
+    """Live bug found during manual verification: the region control
+    (.settings__selected button) is absent from the DOM on the map tab
+    (WordstatView.REGIONS), which every phrase's view loop ends on. Calling
+    _set_region again for phrase #2+ raised InterfaceChangedError on a live
+    Wordstat session. Region persists in the URL across a phrase switch
+    without re-selecting it, so collect_many must only request it once."""
+
+    _patch_common(monkeypatch)
+    set_region_calls = []
+
+    async def recording_collect_one(self, page, session, downloads_path, phrase, region, set_region=True):
+        set_region_calls.append(set_region)
+        return _fake_result(tmp_path, phrase)
+
+    monkeypatch.setattr(WordstatCollector, "_collect_one", recording_collect_one)
+
+    collector = WordstatCollector("cdp", tmp_path)
+    asyncio.run(collector.collect_many(["первый", "второй", "третий"]))
+
+    assert set_region_calls == [True, False, False]
 
 
 def test_collect_many_keeps_results_when_session_stop_raises(monkeypatch, tmp_path):

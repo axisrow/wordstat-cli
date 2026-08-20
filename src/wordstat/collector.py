@@ -131,9 +131,20 @@ class WordstatCollector:
                 await self._wait_for(page, f"() => Boolean(document.querySelector({json.dumps(QUERY_SELECTOR)}))")
                 await self._assert_authenticated(page)
 
-                for phrase in cleaned_phrases:
+                for index, phrase in enumerate(cleaned_phrases):
                     try:
-                        result = await self._collect_one(page, session, downloads_path, phrase, region)
+                        # The region control (.settings__selected button) is
+                        # only present on the table/graph/associations tabs,
+                        # not on the map (WordstatView.REGIONS) tab — and
+                        # every phrase's view loop ends on the map. Calling
+                        # _set_region again for phrase #2+ would hit that tab
+                        # and raise InterfaceChangedError. It also isn't
+                        # needed: confirmed on a live session that Wordstat
+                        # keeps `region=` in the URL across a phrase switch
+                        # without re-selecting it.
+                        result = await self._collect_one(
+                            page, session, downloads_path, phrase, region, set_region=index == 0
+                        )
                         results.append(result)
                     except AuthenticationRequiredError as error:
                         # The session itself is gone: every remaining phrase
@@ -167,6 +178,7 @@ class WordstatCollector:
         downloads_path: Path,
         phrase: str,
         region: str,
+        set_region: bool = True,
     ) -> CollectionResult:
         # Checked once before the batch starts (collect_many), but a session
         # can lose authentication mid-batch (e.g. Yandex logs it out); check
@@ -186,11 +198,15 @@ class WordstatCollector:
         # timeout here must never fail the phrase — see _wait_for_briefly.
         previous_table = await self._table_snapshot(page)
         await self._set_phrase(page, phrase)
-        # Re-applied per phrase: the control is idempotent (it only clicks
-        # checkboxes that are not already in the desired state), and a region
-        # silently reverting to "Все регионы" across a batch would be far
-        # worse than the extra clicks.
-        await self._set_region(page, region)
+        if set_region:
+            # Only for the first phrase of a batch. The region control lives
+            # on the table/graph/associations tabs but not on the map tab
+            # (WordstatView.REGIONS) — and every phrase's view loop ends on
+            # the map, so calling this again for a later phrase would fail
+            # with InterfaceChangedError (confirmed live). It also isn't
+            # needed again: Wordstat keeps `region=` in the URL across a
+            # phrase switch without re-selecting it (confirmed live too).
+            await self._set_region(page, region)
         if previous_table is not None:
             await self._wait_for_briefly(
                 page,
