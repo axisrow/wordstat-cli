@@ -4,9 +4,9 @@ import asyncio
 
 import pytest
 
-from wordstat.collector import WordstatCollector
+from wordstat.collector import WordstatCollector, _is_untrustworthy_empty_export
 from wordstat.errors import InterfaceChangedError
-from wordstat.models import WordstatView
+from wordstat.models import CsvDataset, WordstatView
 
 
 def test_select_view_retries_once_when_active_marker_does_not_change(monkeypatch, tmp_path):
@@ -146,6 +146,40 @@ def test_select_view_keeps_content_change_out_of_the_hard_gate(monkeypatch, tmp_
     assert "!==" in soft_expression
     assert soft_seconds == 3.0
     assert soft_required is False
+
+
+def _dataset(view: WordstatView, rows: list[dict[str, str]]) -> CsvDataset:
+    return CsvDataset(view=view, headers=["query", "count"], rows=rows)
+
+
+@pytest.mark.parametrize("view", [WordstatView.TOP_POPULAR, WordstatView.TOP_RELATED])
+def test_empty_export_is_untrustworthy_for_top_views_regardless_of_dom_state(view):
+    # Regression guard for issue #11: _select_view already hard-gates
+    # TABLE_ROW_SELECTOR.length > 0 on the DOM before "Скачать" is ever
+    # clicked for these two views, so an empty CSV reaching this point is
+    # already a contradiction — it must be rejected unconditionally, with no
+    # second, later DOM read able to wave it through as "legitimately empty"
+    # (that re-read can observe a table that has since emptied and silently
+    # accept a corrupted export — the exact bug this predicate replaces).
+    assert _is_untrustworthy_empty_export(view, _dataset(view, [])) is True
+
+
+@pytest.mark.parametrize("view", [WordstatView.TOP_POPULAR, WordstatView.TOP_RELATED])
+def test_non_empty_export_is_trusted_for_top_views(view):
+    assert _is_untrustworthy_empty_export(view, _dataset(view, [{"query": "a", "count": "1"}])) is False
+
+
+def test_empty_dynamics_export_is_not_flagged_by_this_gate():
+    # Deliberately out of scope: issue #11's live-CDP data showed dynamics
+    # consistently populated (24 rows across all three runs) while
+    # top_popular/top_related alone were empty; the problem is specific to
+    # those two views. See _is_untrustworthy_empty_export's docstring.
+    assert _is_untrustworthy_empty_export(WordstatView.DYNAMICS, _dataset(WordstatView.DYNAMICS, [])) is False
+
+
+def test_empty_regions_export_is_not_flagged_by_this_gate():
+    # regions (map view) has no table in its DOM at all.
+    assert _is_untrustworthy_empty_export(WordstatView.REGIONS, _dataset(WordstatView.REGIONS, [])) is False
 
 
 def test_select_view_does_not_wait_for_table_rows_on_map_view(monkeypatch, tmp_path):
