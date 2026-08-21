@@ -8,7 +8,14 @@ from click.testing import CliRunner
 from wordstat import cli
 from wordstat.cli import main, resolve_phrases
 from wordstat.errors import PhraseEntryError
-from wordstat.models import BatchCollectionResult, CollectionManifest, CollectionResult, PhraseFailure
+from wordstat.models import (
+    BatchCollectionResult,
+    CollectionManifest,
+    CollectionResult,
+    ExportSummary,
+    PhraseFailure,
+    WordstatView,
+)
 
 
 def test_empty_phrase_is_reported_without_a_traceback():
@@ -114,6 +121,73 @@ def test_batch_full_success_exits_zero(monkeypatch, tmp_path: Path):
 
     assert result.exit_code == 0
     assert "Собрано 1 из 1" in result.output
+
+
+def _fake_manifest_with_missing_view(phrase: str) -> CollectionManifest:
+    return CollectionManifest(
+        phrase=phrase,
+        region="Россия",
+        created_at=datetime(2026, 8, 20, 12, 0, tzinfo=UTC),
+        source_url="https://wordstat.yandex.ru/?words=" + phrase,
+        exports=[
+            ExportSummary(
+                view=WordstatView.TOP_POPULAR,
+                file="top_popular.parquet",
+                raw_file=None,
+                row_count=0,
+                dtypes={"Запрос": "string"},
+            ),
+            ExportSummary(
+                view=WordstatView.TOP_RELATED,
+                file="top_related.parquet",
+                raw_file=None,
+                row_count=0,
+                dtypes={"Запрос": "string"},
+            ),
+            ExportSummary(
+                view=WordstatView.DYNAMICS,
+                file="dynamics.parquet",
+                raw_file=None,
+                row_count=12,
+                dtypes={"Дата": "string"},
+            ),
+            # regions deliberately absent: missing_views == [REGIONS]
+        ],
+    )
+
+
+def test_batch_partial_phrase_exits_zero_and_reports_the_missing_view(monkeypatch, tmp_path: Path):
+    """Issue #27: a phrase that collected 3 of 4 views must not print
+    "Собрано 0 из 1" or exit non-zero — it belongs in batch.results (not
+    batch.failures), same as a fully collected phrase, but the CLI must
+    still surface which view is missing and why. Deliberately does NOT
+    assert on manifest.status, which is "incomplete" here for an unrelated
+    reason (empty_views from the always-empty top_popular/top_related, see
+    CLAUDE.md/issue #22) — exit code must not be keyed off that field."""
+
+    async def fake_collect_many(self, phrases, region="Россия", resume_directory=None):
+        run_directory = tmp_path / "чай"
+        manifest_path = run_directory / "manifest.json"
+        return BatchCollectionResult(
+            total=1,
+            results=[
+                CollectionResult(
+                    run_directory=run_directory,
+                    manifest_path=manifest_path,
+                    manifest=_fake_manifest_with_missing_view("чай"),
+                    view_errors={WordstatView.REGIONS: "DownloadTimeoutError: simulated"},
+                )
+            ],
+            failures=[],
+        )
+
+    monkeypatch.setattr(cli.WordstatCollector, "collect_many", fake_collect_many)
+
+    result = CliRunner().invoke(main, ["collect", "чай"])
+
+    assert result.exit_code == 0
+    assert "Собрано 1 из 1, из них частично 1" in result.output
+    assert "чай [regions]: DownloadTimeoutError: simulated" in result.output
 
 
 def test_batch_aborted_early_reports_untried_phrases_distinctly(monkeypatch):

@@ -168,8 +168,24 @@ def collect(
     except WordstatError as error:
         raise click.ClickException(str(error)) from error
 
+    partial_count = 0
     for result in batch.results:
         click.echo(result.manifest_path)
+        # issue #27: a result with missing_views is one where at least one
+        # view failed (but at least one other succeeded — a phrase where
+        # nothing at all was collected never reaches batch.results, see
+        # _collect_one's own guard) — surface that per view instead of
+        # letting "Собрано N из M" imply every phrase in it is complete.
+        # Deliberately NOT keyed off manifest.status: status is
+        # "incomplete" whenever empty_views is non-empty too, and
+        # top_popular/top_related are legitimately empty on every live
+        # Wordstat run (issue #22/#25) — keying success on status would
+        # make ordinary complete runs exit 1 again.
+        if result.manifest.missing_views:
+            partial_count += 1
+            for view in result.manifest.missing_views:
+                reason = result.view_errors.get(view, "не собран")
+                click.echo(f"  {result.manifest.phrase} [{view.value}]: {reason}", err=True)
     for failure in batch.failures:
         click.echo(f"{failure.phrase}: {failure.error}", err=True)
 
@@ -179,6 +195,7 @@ def collect(
     # attempted, so "Собрано N из M" alone would misleadingly read as "all the
     # rest failed".
     suffix = f" (батч прерван, {skipped} фраз(ы) не пробовались)" if skipped else ""
-    click.echo(f"Собрано {len(batch.results)} из {batch.total}{suffix}", err=True)
+    partial_suffix = f", из них частично {partial_count}" if partial_count else ""
+    click.echo(f"Собрано {len(batch.results)} из {batch.total}{partial_suffix}{suffix}", err=True)
     if batch.failures:
         ctx.exit(1)

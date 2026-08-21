@@ -29,6 +29,21 @@ class DownloadTimeoutError(WordstatError):
     """The UI accepted an export request but did not produce a CSV file."""
 
 
+class DownloadEscapedError(WordstatError):
+    """Chrome reported a download outside the run's own downloads directory.
+
+    session.downloaded_files (browser-use) accumulates every path Chrome has
+    ever reported as downloaded across the whole CDP session, regardless of
+    where it actually landed — see issue #27, where the fourth view of a
+    phrase (regions) was reported at an absolute path under the user's real
+    ~/Downloads instead of the collector's own temporary downloads_path. That
+    path must never be moved or deleted (it may be a file the user cares
+    about, and may not even belong to this tool's run at all): this error is
+    raised instead, so the file is left untouched and the failure is loud
+    rather than a silent Errno 1/2 from finalize_raw trying to relocate it.
+    """
+
+
 class CsvFormatError(WordstatError):
     """A downloaded file cannot be decoded as a headed CSV report."""
 

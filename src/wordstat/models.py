@@ -152,11 +152,27 @@ class CollectionResult(BaseModel):
 
     The parsed rows are deliberately not carried here: they are already on disk
     as Parquet, and the manifest describes every export.
+
+    ``view_errors`` (issue #27) records why a view present in
+    ``manifest.missing_views`` did not make it into ``manifest.exports`` —
+    the manifest itself only carries a view's absence, not the reason
+    (``DownloadTimeoutError``, ``InterfaceChangedError``, a parse failure,
+    ...). A phrase where at least one view failed but at least one other
+    succeeded still comes back as a ``CollectionResult`` (not a batch
+    failure — see ``collector._collect_one``), so the operator needs
+    somewhere to read *why* a view is missing without re-running with more
+    logging. Empty when every requested view was collected successfully.
+    Keyed by :class:`WordstatView`, not the raw exception object: the error
+    is only ever read back as text (CLI output), and keeping the exception
+    itself here would hold its traceback/frames alive for as long as this
+    result is (same reasoning as ``PhraseFailure.error`` being stripped of
+    its traceback in ``collector._without_traceback``).
     """
 
     run_directory: Path
     manifest_path: Path
     manifest: CollectionManifest
+    view_errors: dict[WordstatView, str] = Field(default_factory=dict)
 
 
 class PhraseFailure(BaseModel):
