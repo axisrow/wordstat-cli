@@ -96,7 +96,7 @@ def test_collect_many_reuses_one_session_for_all_phrases(monkeypatch, tmp_path):
     _patch_common(monkeypatch)
     _patch_collect_one(monkeypatch, lambda phrase: _async(_fake_result(tmp_path, phrase)))
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
     batch = asyncio.run(collector.collect_many(["чай", "кофе", "вода"]))
 
     assert _FakeSession.instances == 1
@@ -115,7 +115,7 @@ def test_collect_many_isolates_a_single_phrase_failure(monkeypatch, tmp_path):
 
     _patch_collect_one(monkeypatch, flaky)
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
     batch = asyncio.run(collector.collect_many(["первый", "сломается", "второй"]))
 
     assert batch.total == 3
@@ -139,7 +139,7 @@ def test_collect_many_isolates_an_unexpected_exception_type(monkeypatch, tmp_pat
 
     _patch_collect_one(monkeypatch, flaky)
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
     batch = asyncio.run(collector.collect_many(["первый", "сломается", "второй"]))
 
     assert [r.run_directory.name for r in batch.results] == ["первый", "второй"]
@@ -172,7 +172,7 @@ def test_collect_many_aborts_on_lost_authentication_without_trying_the_rest(monk
 
     monkeypatch.setattr(WordstatCollector, "_collect_one", collect_one)
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
     batch = asyncio.run(collector.collect_many(["первый", "второй", "третий"]))
 
     assert attempted == ["первый", "второй"]  # "третий" was never attempted
@@ -197,7 +197,7 @@ def test_collect_one_checks_authentication_on_every_phrase(monkeypatch, tmp_path
     monkeypatch.setattr(WordstatCollector, "_assert_authenticated", counting_assert_authenticated)
     _patch_collect_one_passthrough(monkeypatch, tmp_path)
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
     asyncio.run(collector.collect_many(["первый", "второй", "третий"]))
 
     # Once before the loop (collect_many) + once per phrase (_collect_one).
@@ -254,7 +254,7 @@ def test_collect_many_only_sets_region_for_the_first_phrase(monkeypatch, tmp_pat
 
     monkeypatch.setattr(WordstatCollector, "_collect_one", recording_collect_one)
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
     asyncio.run(collector.collect_many(["первый", "второй", "третий"]))
 
     assert set_region_calls == [True, False, False]
@@ -293,7 +293,7 @@ def test_collect_many_retries_region_after_the_first_phrase_fails(monkeypatch, t
 
     monkeypatch.setattr(WordstatCollector, "_collect_one", recording_collect_one)
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
     batch = asyncio.run(collector.collect_many(["первый", "второй", "третий"]))
 
     assert set_region_calls == [True, True, False]
@@ -338,7 +338,7 @@ def test_collect_many_does_not_retry_region_if_it_was_applied_before_a_later_fai
 
     monkeypatch.setattr(WordstatCollector, "_collect_one", collect_one)
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
     batch = asyncio.run(collector.collect_many(["первый", "второй", "третий"]))
 
     # Region was actually applied while handling "первый" — the second
@@ -361,28 +361,28 @@ def test_collect_many_keeps_results_when_session_stop_raises(monkeypatch, tmp_pa
     monkeypatch.setattr(_FakeSession, "stop", failing_stop)
     _patch_collect_one(monkeypatch, lambda phrase: _async(_fake_result(tmp_path, phrase)))
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
     batch = asyncio.run(collector.collect_many(["чай"]))
 
     assert [r.run_directory.name for r in batch.results] == ["чай"]
 
 
 def test_collect_many_rejects_an_empty_phrase_list(tmp_path):
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
 
     with pytest.raises(InvalidRequestError, match="At least one search phrase"):
         asyncio.run(collector.collect_many([]))
 
 
 def test_collect_many_rejects_a_blank_phrase_in_the_middle(tmp_path):
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
 
     with pytest.raises(InvalidRequestError, match="must not be empty"):
         asyncio.run(collector.collect_many(["чай", "   ", "кофе"]))
 
 
 def test_collect_many_rejects_a_blank_region(tmp_path):
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
 
     with pytest.raises(InvalidRequestError, match="region must not be empty"):
         asyncio.run(collector.collect_many(["чай"], region="  "))
@@ -392,7 +392,7 @@ def test_collect_wraps_collect_many_and_returns_the_single_result(monkeypatch, t
     _patch_common(monkeypatch)
     _patch_collect_one(monkeypatch, lambda phrase: _async(_fake_result(tmp_path, phrase)))
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
     result = asyncio.run(collector.collect(phrase="чай"))
 
     assert result.run_directory.name == "чай"
@@ -406,7 +406,7 @@ def test_collect_propagates_the_original_exception_type(monkeypatch, tmp_path):
 
     _patch_collect_one(monkeypatch, fail)
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
 
     with pytest.raises(PhraseEntryError, match="boom"):
         asyncio.run(collector.collect(phrase="чай"))
@@ -455,7 +455,7 @@ def test_collect_one_preserves_a_table_snapshot_for_the_next_phrase(monkeypatch,
     monkeypatch.setattr(WordstatCollector, "_wait_for", wait)
     monkeypatch.setattr(WordstatCollector, "_download_current_view", download)
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
     page = _FakePage()
     session = _FakeSession()
     asyncio.run(collector._collect_one(page, session, downloads_path, "первая", "Россия", set_region=False))
@@ -499,7 +499,7 @@ def test_collect_one_rescues_the_csv_into_the_run_directory_on_write_failure(mon
     monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
     monkeypatch.setattr(collector_module, "write_dataset", failing_write_dataset)
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
 
     async def run():
         page = _FakePage()
@@ -551,7 +551,7 @@ def test_collect_one_rescue_does_not_error_when_finalize_raw_already_moved_the_f
     monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
     monkeypatch.setattr(collector_module, "write_dataset", flaky_write_dataset)
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
 
     async def run():
         page = _FakePage()
@@ -599,7 +599,7 @@ def test_collect_one_writes_the_manifest_after_every_view_not_only_at_the_end(mo
     monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
     monkeypatch.setattr(collector_module, "write_manifest", recording_write_manifest)
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
 
     async def run():
         page = _FakePage()
@@ -652,7 +652,7 @@ def test_collect_one_resume_directory_only_collects_missing_views(monkeypatch, t
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
     monkeypatch.setattr(WordstatCollector, "_download_current_view", failing_after_first_download)
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
 
     async def run_first():
         page = _FakePage()
@@ -718,7 +718,7 @@ def test_collect_one_resume_directory_rejects_a_different_phrase(monkeypatch, tm
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
     monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
 
     async def run():
         page = _FakePage()
@@ -744,7 +744,7 @@ def test_collect_one_resume_directory_rejects_a_different_phrase(monkeypatch, tm
 
 
 def test_collect_many_rejects_resume_directory_with_more_than_one_phrase(tmp_path):
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
     resume_dir = tmp_path / "some-run"
     resume_dir.mkdir()
 
@@ -776,7 +776,7 @@ def test_collect_one_resume_updates_source_url_and_updated_at_but_not_created_at
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
     monkeypatch.setattr(WordstatCollector, "_download_current_view", failing_download)
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
 
     async def run_first():
         page = _FakePage(url="https://wordstat.yandex.ru/?words=тест&region=Россия")
@@ -848,7 +848,7 @@ def test_collect_one_resume_of_an_already_complete_run_does_not_touch_the_manife
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
     monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
 
-    collector = WordstatCollector("cdp", tmp_path)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
 
     async def run_full():
         page = _FakePage(url="https://wordstat.yandex.ru/?words=тест")

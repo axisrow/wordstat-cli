@@ -123,11 +123,25 @@ class WordstatCollector:
         output_root: Path,
         timeout_seconds: float = 45.0,
         keep_raw: bool = False,
+        settling_seconds: float = 1.0,
+        empty_export_retry_seconds: float = 2.0,
     ) -> None:
         self.cdp_url = cdp_url
         self.output_root = output_root
         self.timeout_seconds = timeout_seconds
         self.keep_raw = keep_raw
+        # Both are real, unconditional pauses against the live UI (see their
+        # call sites in _collect_one) — not upper-bound timeouts like
+        # timeout_seconds, which _wait_for polls against a condition and
+        # returns from early. Nothing in the live DOM signals "the export
+        # blob has been rebuilt" or "the empty table has repainted", so
+        # there is no condition for _wait_for to poll here; a fixed sleep is
+        # the only available fix. Kept as constructor parameters (not
+        # hardcoded) so tests against a fake, instantly-responding page can
+        # set them to 0 instead of actually blocking the test process for
+        # real wall-clock time on every view of every phrase.
+        self.settling_seconds = settling_seconds
+        self.empty_export_retry_seconds = empty_export_retry_seconds
         self._previous_table_snapshot: str | None = None
 
     async def collect(
@@ -406,8 +420,8 @@ class WordstatCollector:
             # blob has been rebuilt for the selected phrase/view. A short
             # settling interval prevents a header-only CSV from racing the
             # table repaint; the structural row gate above remains required.
-            if view is not WordstatView.REGIONS:
-                await asyncio.sleep(1.0)
+            if view is not WordstatView.REGIONS and self.settling_seconds > 0:
+                await asyncio.sleep(self.settling_seconds)
             if view is WordstatView.DYNAMICS and (
                 granularity is not Granularity.MONTHLY or date_from is not None
             ):
@@ -422,7 +436,8 @@ class WordstatCollector:
                 # empty table export once before failing closed.
                 dataset = parse_wordstat_csv(source, view)
                 if _is_untrustworthy_empty_export(view, dataset):
-                    await asyncio.sleep(2.0)
+                    if self.empty_export_retry_seconds > 0:
+                        await asyncio.sleep(self.empty_export_retry_seconds)
                     source = await self._download_current_view(page, session, downloads_path)
                     dataset = parse_wordstat_csv(source, view)
                 if _is_untrustworthy_empty_export(view, dataset):
