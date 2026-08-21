@@ -164,11 +164,11 @@ def merge_export(
 
     Keeps ``exports`` ordered by :class:`WordstatView` declaration order
     (not append order) so a resumed run's manifest looks the same as one
-    collected in a single pass. ``missing_views``/``status`` are computed
-    fields derived straight from ``exports`` (see
+    collected in a single pass. ``missing_views``/``empty_views``/``status``
+    are computed fields derived straight from ``exports`` (see
     :class:`~wordstat.models.CollectionManifest`), so updating only
     ``exports`` here is enough to keep them correct — there is nothing else
-    to recompute for those two.
+    to recompute for those three.
 
     ``updated_at`` is bumped to ``now`` (defaulting to the current UTC time,
     like :func:`create_run_directory` — a caller can pass a fixed value for

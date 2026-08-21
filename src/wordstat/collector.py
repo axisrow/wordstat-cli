@@ -74,46 +74,59 @@ RUSSIAN_MONTHS_GENITIVE = (
 def _is_untrustworthy_empty_export(view: WordstatView, dataset: CsvDataset) -> bool:
     """True if an empty CSV for this view can never be a legitimate export.
 
-    TOP_POPULAR/TOP_RELATED/DYNAMICS are checked — every view for which
-    _select_view hard-gates TABLE_ROW_SELECTOR.length > 0 on the DOM before
-    the "Скачать" click is ever issued (see the docstring on _select_view
-    and CLAUDE.md's issue #3/#13 section). REGIONS is the only view exempt
-    from that gate (it is a map with no table rows in its DOM), so it is the
-    only view exempt here too — this set must stay in lockstep with
-    _select_view's `if view != WordstatView.REGIONS:` condition, not be
-    picked per-view by hand.
+    Only DYNAMICS is checked. This used to also cover TOP_POPULAR/
+    TOP_RELATED on the theory that _select_view's pre-download hard gate
+    (TABLE_ROW_SELECTOR.length > 0, see that method's docstring and
+    CLAUDE.md's issue #3/#13 section) makes an empty CSV a structural
+    contradiction for every table-based view alike — "the DOM proved
+    rows>0 moments earlier, so the export cannot legitimately be empty".
 
-    A phrase that clears the pre-download gate has already had the code
-    itself prove TABLE_ROW_SELECTOR.length > 0 moments earlier; genuinely
-    zero rows never reaches the download step at all — it dies inside
-    _select_view's retry loop with InterfaceChangedError instead. So by the
-    time a dataset for one of these views is parsed here, an empty
-    dataset.rows already contradicts a state the code itself proved moments
-    earlier; there is no code path left where that emptiness is legitimate,
-    for any of the three table-based views alike.
+    Issue #22 found that premise false, with a live counterexample: issue
+    #11 recorded TOP_POPULAR/TOP_RELATED returning an empty CSV from a
+    manual click on the export link, entirely outside this code path — so
+    the DOM showing rows before the click does *not* prove the exported
+    file cannot be empty. Worse, TOP_POPULAR is the first view in
+    VIEW_SELECTORS and is *always* empty on live Wordstat regardless of
+    phrase — not a rare race but a permanent property of that report. Once
+    this predicate covered it, every full collect() run failed closed on
+    the very first view and never reached DYNAMICS/REGIONS at all: the
+    fix for issue #11 (never silently swallow an anomalous empty export)
+    had turned into "the tool no longer completes a single run".
 
-    This used to be conditioned on a second, post-download DOM read
-    (`rendered_rows > 0`) — but re-querying the DOM after the download's
+    So "the DOM proved rows>0 structurally" was never the right criterion.
+    The criterion that actually distinguishes these views, per issue #11's
+    live measurements and PR #20's, is empirical: does Wordstat reliably
+    return a non-empty file for this view at all? For TOP_POPULAR/
+    TOP_RELATED, no — never, confirmed live, so an empty export from them
+    is the expected, honest case, not an anomaly to fail closed on; the
+    caller (._collect_one) still records it as a normal ExportSummary with
+    row_count: 0, which is what makes the emptiness visible in
+    manifest.json instead of silently absent (issue #16's concern, at
+    least for these two views — see CLAUDE.md and this issue for the
+    `status`/`missing_views` computed fields that make row_count: 0 alone
+    not sufficient for the third, DYNAMICS). For DYNAMICS, yes — issue
+    #11 measured 24 rows across three separate live runs, never empty, and
+    PR #20 corroborates it; an empty DYNAMICS export is genuinely
+    anomalous, so it stays behind the fail-closed gate below (with
+    _collect_one's existing empty_export_retry_seconds retry ahead of it).
+
+    REGIONS was never part of this set: it is the one view _select_view's
+    hard gate itself exempts (a map has no TABLE_ROW_SELECTOR rows in its
+    DOM at all), so there is no structural premise to begin with, and no
+    live evidence of an empty regions.parquet either.
+
+    This used to also be conditioned on a second, post-download DOM read
+    (`rendered_rows > 0`) — re-querying the DOM after the download's
     unbounded polling window can observe a table that has since emptied
     (rerender, auth transition, page degradation), which let the empty
     export through as an apparently valid `row_count: 0` and silently
-    corrupt the manifest into `status: "complete"` — the exact failure mode
-    issue #11's fix was meant to close. The pre-download gate is already
-    proof enough; no second opinion from a later DOM read is needed or
-    trustworthy. See tests/test_collector_view.py.
-
-    DYNAMICS was previously excluded on the strength of issue #11's live-CDP
-    data (24 rows across three runs, never empty) — but that is evidence the
-    gate rarely fires for DYNAMICS, not evidence that omitting it is safe.
-    The gate's premise is structural (the DOM proved rows>0 immediately
-    before the click), and that premise holds for DYNAMICS exactly as it
-    does for TOP_POPULAR/TOP_RELATED; selecting views by observed frequency
-    of emptiness rather than by the structural gate they share was the bug.
+    corrupt the manifest into `status: "complete"` — the exact failure
+    mode issue #11's fix was meant to close for DYNAMICS. That reasoning
+    is unaffected by this change and still applies to DYNAMICS: no second
+    opinion from a later DOM read is needed or trustworthy here. See
+    tests/test_collector_view.py.
     """
-    return (
-        view in (WordstatView.TOP_POPULAR, WordstatView.TOP_RELATED, WordstatView.DYNAMICS)
-        and not dataset.rows
-    )
+    return view is WordstatView.DYNAMICS and not dataset.rows
 
 
 def _without_traceback(error: Exception) -> Exception:
@@ -163,11 +176,7 @@ class WordstatCollector:
         # chosen without a live timing measurement, not derived from one.
         # Cost: +1s per non-map view, +3s per phrase (3 of 4 views are
         # non-map), so +50s across a 50-phrase batch. Do not remove without
-        # a way to verify nothing regresses — issue #22 currently blocks a
-        # full CLI run from reaching DYNAMICS at all (see collector.py's
-        # fail-closed behavior on empty top exports), so there is no cheap
-        # end-to-end signal today that would catch a regression from
-        # removing this.
+        # a way to verify nothing regresses against a live run.
         #
         # empty_export_retry_seconds: unlike the above, this one does have
         # a concrete, structural trigger — it only fires after
@@ -257,6 +266,11 @@ class WordstatCollector:
                 allowed_domains=["wordstat.yandex.ru", "passport.yandex.ru"],
                 keep_alive=True,
             )
+            # Declared before the try so the finally below can check "was a
+            # tab actually created" even if session.start() itself raised
+            # (in which case new_page() was never reached and there is
+            # nothing of ours to close).
+            page = None
             try:
                 await session.start()
                 page = await session.new_page()
@@ -320,6 +334,22 @@ class WordstatCollector:
                         # SystemExit) deliberately still propagates.
                         failures.append(PhraseFailure(phrase=phrase, error=_without_traceback(error)))
             finally:
+                # Close only the tab this batch created (issue #9): new_page()
+                # above opens exactly one tab for the whole batch (not one per
+                # phrase), keep_alive=True correctly leaves the user's own
+                # Chrome and its other tabs untouched, but that same flag also
+                # means session.stop() below never closes *our* tab either —
+                # left unclosed, every CLI invocation orphans one more tab.
+                # Must run before session.stop(): the CDP handle backing
+                # `page` may no longer be usable once the session itself has
+                # stopped. Wrapped the same way as session.stop() below —
+                # a failed close() (tab already gone, CDP hiccup) must not
+                # discard the results/failures already collected.
+                if page is not None:
+                    try:
+                        await session.close_page(page)
+                    except Exception:  # noqa: BLE001
+                        pass
                 try:
                     await session.stop()
                 except Exception:  # noqa: BLE001
