@@ -66,7 +66,7 @@ def _fake_manifest(phrase: str) -> CollectionManifest:
 
 
 def test_batch_failure_on_one_phrase_does_not_stop_the_rest(monkeypatch, tmp_path: Path):
-    async def fake_collect_many(self, phrases, region="Россия"):
+    async def fake_collect_many(self, phrases, region="Россия", resume_directory=None):
         assert phrases == ["чай", "кофе"]
         run_directory = tmp_path / "чай"
         manifest_path = run_directory / "manifest.json"
@@ -93,7 +93,7 @@ def test_batch_failure_on_one_phrase_does_not_stop_the_rest(monkeypatch, tmp_pat
 
 
 def test_batch_full_success_exits_zero(monkeypatch, tmp_path: Path):
-    async def fake_collect_many(self, phrases, region="Россия"):
+    async def fake_collect_many(self, phrases, region="Россия", resume_directory=None):
         run_directory = tmp_path / "чай"
         manifest_path = run_directory / "manifest.json"
         return BatchCollectionResult(
@@ -117,7 +117,7 @@ def test_batch_full_success_exits_zero(monkeypatch, tmp_path: Path):
 
 
 def test_batch_aborted_early_reports_untried_phrases_distinctly(monkeypatch):
-    async def fake_collect_many(self, phrases, region="Россия"):
+    async def fake_collect_many(self, phrases, region="Россия", resume_directory=None):
         # Only the first of 3 phrases was attempted (and failed) before the
         # batch aborted; the CLI must not read this as "2 more failed".
         return BatchCollectionResult(
@@ -153,4 +153,48 @@ def test_phrases_file_with_undecodable_bytes_is_reported_without_a_traceback(tmp
 
     assert result.exit_code != 0
     assert "Cannot decode --phrases-file" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_resume_dir_with_more_than_one_phrase_is_rejected_before_the_browser_starts(tmp_path: Path):
+    resume_dir = tmp_path / "some-run"
+    resume_dir.mkdir()
+
+    result = CliRunner().invoke(main, ["collect", "чай", "кофе", "--resume-dir", str(resume_dir)])
+
+    assert result.exit_code != 0
+    assert "--resume-dir requires exactly one phrase" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_resume_dir_that_does_not_exist_is_reported_by_click(tmp_path: Path):
+    missing = tmp_path / "does-not-exist"
+
+    result = CliRunner().invoke(main, ["collect", "чай", "--resume-dir", str(missing)])
+
+    assert result.exit_code != 0
+    assert "Traceback" not in result.output
+
+
+def test_resume_dir_mismatched_phrase_is_rejected_before_the_browser_starts(tmp_path: Path):
+    from wordstat.models import CollectionManifest as _Manifest
+    from wordstat.storage import write_manifest
+
+    resume_dir = tmp_path / "some-run"
+    resume_dir.mkdir()
+    write_manifest(
+        resume_dir / "manifest.json",
+        _Manifest(
+            phrase="чай",
+            region="Россия",
+            created_at=datetime(2026, 8, 20, 12, 0, tzinfo=UTC),
+            source_url="https://wordstat.yandex.ru/?words=чай",
+            exports=[],
+        ),
+    )
+
+    result = CliRunner().invoke(main, ["collect", "кофе", "--resume-dir", str(resume_dir)])
+
+    assert result.exit_code != 0
+    assert "does not match" in result.output
     assert "Traceback" not in result.output

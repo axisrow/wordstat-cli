@@ -27,7 +27,14 @@ from wordstat.models import (
     PhraseFailure,
     WordstatView,
 )
-from wordstat.storage import create_run_directory, finalize_raw, write_manifest
+from wordstat.storage import (
+    create_run_directory,
+    finalize_raw,
+    merge_export,
+    prepare_resume_directory,
+    views_to_collect,
+    write_manifest,
+)
 
 WORDSTAT_URL = "https://wordstat.yandex.ru/"
 QUERY_SELECTOR = 'input[placeholder="Введите слово или словосочетание"]'
@@ -73,10 +80,12 @@ class WordstatCollector:
         self.timeout_seconds = timeout_seconds
         self.keep_raw = keep_raw
 
-    async def collect(self, phrase: str, region: str = "Россия") -> CollectionResult:
+    async def collect(
+        self, phrase: str, region: str = "Россия", resume_directory: Path | None = None
+    ) -> CollectionResult:
         """Collect popular, related, dynamics and regional reports for one phrase."""
 
-        batch = await self.collect_many([phrase], region=region)
+        batch = await self.collect_many([phrase], region=region, resume_directory=resume_directory)
         if batch.failures:
             raise batch.failures[0].error
         if not batch.results:
@@ -87,7 +96,12 @@ class WordstatCollector:
             raise InvalidRequestError("Collecting the phrase produced neither a result nor a failure")
         return batch.results[0]
 
-    async def collect_many(self, phrases: list[str], region: str = "Россия") -> BatchCollectionResult:
+    async def collect_many(
+        self,
+        phrases: list[str],
+        region: str = "Россия",
+        resume_directory: Path | None = None,
+    ) -> BatchCollectionResult:
         """Collect reports for several phrases inside a single browser session.
 
         A failure on one phrase is recorded and does not stop the remaining
@@ -95,6 +109,12 @@ class WordstatCollector:
         collected because of one bad phrase.  A lost authentication, however,
         means the session itself is no longer usable, so it aborts the batch
         instead of repeating the same failure for every remaining phrase.
+
+        ``resume_directory`` requests appending missing views to an existing
+        run directory instead of creating a new one, and is only valid for a
+        single phrase: one run directory holds one phrase's manifest, so
+        resuming while collecting several phrases could not be applied to
+        all of them without splicing unrelated exports into one manifest.
         """
 
         region = region.strip()
@@ -106,6 +126,8 @@ class WordstatCollector:
         cleaned_phrases = [phrase.strip() for phrase in phrases]
         if not all(cleaned_phrases):
             raise InvalidRequestError("The search phrase must not be empty")
+        if resume_directory is not None and len(cleaned_phrases) != 1:
+            raise InvalidRequestError("--resume-dir requires exactly one phrase")
 
         results: list[CollectionResult] = []
         failures: list[PhraseFailure] = []
@@ -172,6 +194,7 @@ class WordstatCollector:
                             region,
                             set_region=not region_ready,
                             on_region_applied=_mark_region_ready,
+                            resume_directory=resume_directory,
                         )
                         results.append(result)
                     except AuthenticationRequiredError as error:
@@ -208,6 +231,7 @@ class WordstatCollector:
         region: str,
         set_region: bool = True,
         on_region_applied: Callable[[], None] | None = None,
+        resume_directory: Path | None = None,
     ) -> CollectionResult:
         # Checked once before the batch starts (collect_many), but a session
         # can lose authentication mid-batch (e.g. Yandex logs it out); check
@@ -216,7 +240,27 @@ class WordstatCollector:
         # silently stopped working.
         await self._assert_authenticated(page)
 
-        run_directory = create_run_directory(self.output_root, phrase)
+        if resume_directory is not None:
+            # prepare_resume_directory is the hard reject against the main
+            # data-corruption risk here: it never reuses a directory whose
+            # stored phrase/region don't match this request. create_run_directory's
+            # own never-overwrite guarantee is untouched — resuming is this
+            # separate, explicit path, not a fallback baked into it.
+            run_directory = resume_directory
+            manifest = prepare_resume_directory(run_directory, phrase, region)
+            manifest_path = run_directory / "manifest.json"
+            pending_views = views_to_collect(run_directory, manifest)
+            if not pending_views:
+                return CollectionResult(
+                    run_directory=run_directory,
+                    manifest_path=manifest_path,
+                    manifest=manifest,
+                )
+        else:
+            run_directory = create_run_directory(self.output_root, phrase)
+            manifest = None
+            manifest_path = run_directory / "manifest.json"
+            pending_views = list(WordstatView)
         # In a batch, the previous phrase's table can still be sitting in the
         # DOM when _set_phrase's own waits (new `words=` in the URL, download
         # button present) are satisfied — those don't check the table itself.
@@ -252,8 +296,44 @@ class WordstatCollector:
                 required=False,
             )
 
-        exports = []
-        for view, selector in VIEW_SELECTORS.items():
+        if manifest is None:
+            # Written once up front (exports=[], so missing_views/status are
+            # derived as every view missing / "incomplete") so a crash before
+            # the first view even finishes still leaves a manifest.json on
+            # disk describing an empty-but-started run, instead of nothing.
+            # updated_at is set here too (equal to created_at for this first
+            # write): leaving it null would make null ambiguous between "a
+            # successful write already happened" and "this manifest predates
+            # the updated_at field" — see CollectionManifest's docstring,
+            # which promises null means only the latter.
+            start = datetime.now(UTC)
+            manifest = CollectionManifest(
+                phrase=phrase,
+                region=region,
+                created_at=start,
+                updated_at=start,
+                source_url=await page.get_url(),
+                exports=[],
+            )
+            write_manifest(manifest_path, manifest)
+        else:
+            # Resuming: source_url must not silently keep pointing at
+            # whatever tab/phrase the *previous* session ended on — it is
+            # only accurate as of the last successful write (see
+            # CollectionManifest's docstring), and this write is that.
+            # created_at is deliberately left untouched: it marks when this
+            # run started, not when every view was collected, and a resumed
+            # run's views can legitimately span more than one session.
+            # Doing this after _set_phrase (not before) is required: the
+            # page is still on the previous phrase/tab until _set_phrase
+            # returns.
+            manifest = manifest.model_copy(
+                update={"source_url": await page.get_url(), "updated_at": datetime.now(UTC)}
+            )
+            write_manifest(manifest_path, manifest)
+
+        for view in pending_views:
+            selector = VIEW_SELECTORS[view]
             await self._select_view(page, selector, view)
             source = await self._download_current_view(page, session, downloads_path)
             try:
@@ -273,25 +353,21 @@ class WordstatCollector:
                 if source.exists():
                     source.replace(run_directory / source.name)
                 raise
-            exports.append(
-                ExportSummary(
-                    view=view,
-                    file=data_path.name,
-                    raw_file=raw_path.name if raw_path else None,
-                    row_count=len(dataset.rows),
-                    dtypes=dtypes,
-                )
+            export = ExportSummary(
+                view=view,
+                file=data_path.name,
+                raw_file=raw_path.name if raw_path else None,
+                row_count=len(dataset.rows),
+                dtypes=dtypes,
             )
+            # Rewritten after every view, not just once at the end: an
+            # interruption between views must leave a manifest that honestly
+            # reflects the views collected so far (see write_manifest and
+            # CollectionManifest.status), not a stale one still claiming
+            # every view is missing.
+            manifest = merge_export(manifest, export)
+            write_manifest(manifest_path, manifest)
 
-        manifest = CollectionManifest(
-            phrase=phrase,
-            region=region,
-            created_at=datetime.now(UTC),
-            source_url=await page.get_url(),
-            exports=exports,
-        )
-        manifest_path = run_directory / "manifest.json"
-        write_manifest(manifest_path, manifest)
         return CollectionResult(
             run_directory=run_directory,
             manifest_path=manifest_path,

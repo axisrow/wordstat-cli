@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 
 class WordstatView(StrEnum):
@@ -46,13 +46,81 @@ class ExportSummary(BaseModel):
 
 
 class CollectionManifest(BaseModel):
-    """Reproducibility metadata written beside the converted Parquet files."""
+    """Reproducibility metadata written beside the converted Parquet files.
+
+    Written incrementally, once per successfully collected view (see
+    ``collector._collect_one``), so a run interrupted partway through leaves
+    a manifest on disk that honestly describes what it has so far rather than
+    none at all.
+
+    ``exports`` is the single source of truth for completeness: both
+    ``missing_views`` (every :class:`WordstatView` not yet present in
+    ``exports``, in enum declaration order) and ``status`` are *derived* from
+    it via ``computed_field`` rather than stored fields, so there is no way
+    to construct a manifest where they disagree with ``exports`` — the bug
+    this feature exists to avoid (a caller building
+    ``CollectionManifest(exports=[])`` without separately remembering to set
+    ``missing_views`` would otherwise silently get a manifest that lies about
+    being complete). Both are still plain JSON fields in ``manifest.json`` on
+    disk (pydantic includes computed fields in ``model_dump_json`` by
+    default), which is what makes "incomplete" visible to a reader of the
+    file itself, not only on the in-memory object.
+
+    Three timestamp/URL fields describe when and where the data came from,
+    and their semantics differ deliberately once ``--resume-dir`` is in
+    play:
+
+    - ``created_at`` is set once, when the run directory is first created,
+      and never touched again by a resume. It answers "when did this run
+      start", not "when was every view collected" — a resumed run's views
+      can legitimately come from different moments in time.
+    - ``updated_at`` is the timestamp of the most recent successful write to
+      this manifest (the initial write or any later resume), so a reader
+      can tell a fresh run from one stitched together over several
+      sessions. ``None`` means the manifest predates this field (written by
+      an older version of this tool) — it is optional so
+      :func:`~wordstat.storage.load_manifest` can still read a
+      manifest.json that lacks it, rather than rejecting an otherwise
+      resumable directory with a validation error.
+    - ``source_url`` reflects the page URL at the time of the *last*
+      successful write, not the first: a resume updates it to the current
+      run's URL (see ``collector._collect_one``), so it never silently
+      keeps pointing at a stale phrase/tab from a previous session.
+
+    A ``model_validator`` rejects a manifest whose ``exports`` contain more
+    than one entry for the same :class:`WordstatView`. The normal write path
+    (``storage.merge_export``) can never produce that — it keeps exports in
+    a dict keyed by view — but this guards
+    :func:`~wordstat.storage.load_manifest` against a manifest.json that was
+    hand-edited or corrupted on disk before a resume reads it back: without
+    this, ``views_to_collect`` would silently pick whichever duplicate entry
+    appears first.
+    """
 
     phrase: str
     region: str
     created_at: datetime
+    updated_at: datetime | None = None
     source_url: str
     exports: list[ExportSummary]
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def missing_views(self) -> list[WordstatView]:
+        present = {export.view for export in self.exports}
+        return [view for view in WordstatView if view not in present]
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def status(self) -> str:
+        return "incomplete" if self.missing_views else "complete"
+
+    @model_validator(mode="after")
+    def _exports_have_unique_views(self) -> "CollectionManifest":
+        views = [export.view for export in self.exports]
+        if len(views) != len(set(views)):
+            raise ValueError("Manifest contains duplicate view exports")
+        return self
 
 
 class CollectionResult(BaseModel):
