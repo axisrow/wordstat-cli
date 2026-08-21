@@ -79,6 +79,7 @@ class WordstatCollector:
         self.output_root = output_root
         self.timeout_seconds = timeout_seconds
         self.keep_raw = keep_raw
+        self._previous_table_snapshot: str | None = None
 
     async def collect(
         self, phrase: str, region: str = "Россия", resume_directory: Path | None = None
@@ -261,15 +262,13 @@ class WordstatCollector:
             manifest = None
             manifest_path = run_directory / "manifest.json"
             pending_views = list(WordstatView)
-        # In a batch, the previous phrase's table can still be sitting in the
-        # DOM when _set_phrase's own waits (new `words=` in the URL, download
-        # button present) are satisfied — those don't check the table itself.
-        # Snapshot it before switching phrases so we can give Wordstat a
-        # short extra moment to re-render for the new phrase. This is a best
-        # effort nudge, not a hard gate: two different (e.g. related) phrases
-        # can legally produce the same first row, or an empty table, so a
-        # timeout here must never fail the phrase — see _wait_for(required=False).
-        previous_table = await self._table_snapshot(page)
+        # The preceding complete view loop ends on REGIONS, whose map has no
+        # table. Keep the last table snapshot while a table view is visible
+        # so the next phrase gets the best-effort re-render nudge. Content
+        # equality is only evidence, never a gate: related phrases can
+        # legally have the same first row (or no row).
+        previous_table = self._previous_table_snapshot
+        self._previous_table_snapshot = None
         await self._set_phrase(page, phrase)
         if set_region:
             # Only until region is actually applied — collect_many tracks
@@ -353,12 +352,15 @@ class WordstatCollector:
                 if source.exists():
                     source.replace(run_directory / source.name)
                 raise
+            if view != WordstatView.REGIONS:
+                self._previous_table_snapshot = await self._table_snapshot(page)
             export = ExportSummary(
                 view=view,
                 file=data_path.name,
                 raw_file=raw_path.name if raw_path else None,
                 row_count=len(dataset.rows),
                 dtypes=dtypes,
+            )
             )
             # Rewritten after every view, not just once at the end: an
             # interruption between views must leave a manifest that honestly
@@ -480,38 +482,15 @@ class WordstatCollector:
         # (checked on the live page). Retry the click once if the marker
         # does not become active before the normal wait timeout.
         #
-        # The radio flipping to checked does not mean the table has
-        # repainted yet: for the three table-based views, the download
-        # button and an active marker can both be true while the DOM still
-        # shows the *previous* view's rows (or none), so downloading right
-        # then silently produces a header-only CSV (row_count: 0 — see
-        # issue #3 and the known-issue note in CLAUDE.md). REGIONS (the
-        # map) has no table rows at all, so it is exempt from this extra
-        # gate — requiring row presence there would hang forever.
+        # For table-based views, the radio and download button can become
+        # ready before the table itself renders. Row presence therefore stays
+        # in the hard gate: without it Wordstat can download a header-only
+        # CSV. REGIONS is a map with no table rows, so it is exempt.
         #
-        # Row *presence* alone doesn't prove the rows are the new view's,
-        # not stale leftovers from the previous one — the same ambiguity
-        # `_collect_one` already handles for phrase switches via a table
-        # snapshot. A first pass at this (see PR #7 history) snapshotted
-        # the table unconditionally and required it change after the click
-        # — but the view loop always starts with TOP_POPULAR, and Wordstat
-        # is normally already showing that exact view right after a search,
-        # so clicking its own already-active tab has no reason to change
-        # the table at all: the gate was unconditionally unsatisfiable on
-        # the very first view of every phrase (found in review, round 2).
-        #
-        # Fix: read whether the target tab is ALREADY checked before
-        # clicking. If so, Wordstat isn't switching views at all — the
-        # click is a same-view no-op — so only the plain checked+download
-        # (+rows for table views) predicate applies, with no content-delta
-        # requirement. Only when the target tab is genuinely inactive
-        # before the click do we snapshot the table and require its content
-        # to differ, because that is the only case where "did the view
-        # actually repaint" is a real question.
-        was_already_active = view != WordstatView.REGIONS and await self._is_view_active(page, selector)
-        previous_table = (
-            await self._table_snapshot(page) if view != WordstatView.REGIONS and not was_already_active else None
-        )
+        # A change in table text is useful corroborating evidence, but cannot
+        # be a hard gate: different views can legitimately have the same
+        # first row. Check it separately and best-effort after the hard gate.
+        previous_table = await self._table_snapshot(page) if view != WordstatView.REGIONS else None
         target_selector = json.dumps(selector)
         ready_expression = f"""() => {{
             const label = document.querySelector({target_selector});
@@ -523,16 +502,7 @@ class WordstatCollector:
             ready_expression += (
                 f"\n                && document.querySelectorAll({json.dumps(TABLE_ROW_SELECTOR)}).length > 0"
             )
-            if not was_already_active:
-                ready_expression += (
-                    f"\n                && document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.textContent"
-                    f" !== {json.dumps(previous_table)};"
-                )
-            else:
-                ready_expression += ";"
-        else:
-            ready_expression += ";"
-        ready_expression += "\n        }"
+        ready_expression += ";\n        }"
         # Two attempts must not cost double the configured timeout budget
         # (issue found in review): split it so the worst case across both
         # attempts still matches self.timeout_seconds, not 2x it.
@@ -541,20 +511,18 @@ class WordstatCollector:
             await self._click(page, selector)
             try:
                 await self._wait_for(page, ready_expression, seconds=attempt_seconds)
-                return
+                break
             except InterfaceChangedError:
                 if attempt == 1:
                     raise
-
-    async def _is_view_active(self, page, selector: str) -> bool:
-        target_selector = json.dumps(selector)
-        result = await page.evaluate(f"""() => {{
-            const label = document.querySelector({target_selector});
-            const input = label?.querySelector('input')
-                ?? (label?.htmlFor ? document.getElementById(label.htmlFor) : null);
-            return Boolean(input?.checked);
-        }}""")
-        return bool(result)
+        if previous_table is not None:
+            await self._wait_for(
+                page,
+                f"() => document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.textContent"
+                f" !== {json.dumps(previous_table)}",
+                seconds=3.0,
+                required=False,
+            )
 
     async def _table_snapshot(self, page) -> str | None:
         return await page.evaluate(
@@ -625,12 +593,11 @@ class WordstatCollector:
     async def _wait_for(self, page, expression: str, seconds: float | None = None, required: bool = True) -> None:
         """Poll `expression` until it's true, or give up after the deadline.
 
-        `required=False` (used for the staleness nudge in _collect_one) makes
-        the timeout a no-op instead of a failure: two different phrases can
-        legally produce the same table content, so that signal is a useful
-        hint but not a reliable gate — a timeout there just means the nudge
-        could not confirm anything either way, and the caller proceeds
-        regardless.
+        `required=False` (used for table-content corroboration in
+        _collect_one and _select_view) makes the timeout a no-op instead of a
+        failure: different phrases or views can legally produce the same
+        table content, so that signal is a useful hint but not a reliable
+        gate — a timeout just means it could not confirm anything either way.
         """
         deadline = time.monotonic() + (seconds if seconds is not None else self.timeout_seconds)
         while time.monotonic() < deadline:

@@ -420,6 +420,57 @@ def _write_view_csv(path, phrase):
     path.write_text(f"Запрос;Показов\n{phrase};100\n", encoding="cp1251")
 
 
+def test_collect_one_preserves_a_table_snapshot_for_the_next_phrase(monkeypatch, tmp_path):
+    """The map is last, so the next phrase must not snapshot it as None."""
+
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+    waits = []
+    snapshots = iter(
+        ["popular first", "related first", "dynamics first", "popular second", "related second", "dynamics second"]
+    )
+    download_count = 0
+
+    async def noop(*args, **kwargs):
+        pass
+
+    async def snapshot(self, page):
+        return next(snapshots)
+
+    async def wait(self, page, expression, seconds=None, required=True):
+        waits.append((expression, seconds, required))
+
+    async def download(self, page, session, directory):
+        nonlocal download_count
+        download_count += 1
+        source = directory / f"export-{download_count}.csv"
+        _write_view_csv(source, "тест")
+        return source
+
+    monkeypatch.setattr(WordstatCollector, "_assert_authenticated", noop)
+    monkeypatch.setattr(WordstatCollector, "_set_phrase", noop)
+    monkeypatch.setattr(WordstatCollector, "_set_region", noop)
+    monkeypatch.setattr(WordstatCollector, "_select_view", noop)
+    monkeypatch.setattr(WordstatCollector, "_table_snapshot", snapshot)
+    monkeypatch.setattr(WordstatCollector, "_wait_for", wait)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", download)
+
+    collector = WordstatCollector("cdp", tmp_path)
+    page = _FakePage()
+    session = _FakeSession()
+    asyncio.run(collector._collect_one(page, session, downloads_path, "первая", "Россия", set_region=False))
+    asyncio.run(collector._collect_one(page, session, downloads_path, "вторая", "Россия", set_region=False))
+
+    assert waits == [
+        (
+            '() => document.querySelector(".table__wrapper tbody tr")?.textContent !== "dynamics first"',
+            3.0,
+            False,
+        )
+    ]
+    assert collector._previous_table_snapshot == "dynamics second"
+
+
 def test_collect_one_rescues_the_csv_into_the_run_directory_on_write_failure(monkeypatch, tmp_path):
     """A4: the CSV rescue must trigger for ANY failure past parsing (e.g. a
     write_dataset/pyarrow error), not just CsvFormatError — and the original
