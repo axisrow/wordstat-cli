@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from wordstat.errors import ResumeMismatchError
+from wordstat.errors import DownloadEscapedError, ResumeMismatchError
 from wordstat.models import CollectionManifest, ExportSummary, WordstatView
 from wordstat.storage import (
     create_run_directory,
@@ -80,6 +80,68 @@ def test_finalize_raw_renames_the_download_when_keeping_it(tmp_path: Path) -> No
 
 def test_finalize_raw_tolerates_an_already_missing_download(tmp_path: Path) -> None:
     assert finalize_raw(tmp_path / "gone.csv", tmp_path, WordstatView.DYNAMICS, keep_raw=False) is None
+
+
+def test_finalize_raw_refuses_a_source_outside_the_run_directory(tmp_path: Path) -> None:
+    """Issue #27 belt-and-suspenders: even if a caller ever passes a source
+    path that escaped the collector's own downloads_path (e.g. a stray path
+    Chrome reported under the user's real ~/Downloads), finalize_raw must
+    never move or delete it — regardless of keep_raw. The file must be left
+    exactly where it was and a domain error raised instead of a bare OSError
+    (Errno 1 on macOS's TCC-protected ~/Downloads) or, worse, a silent
+    unlink() of a file the tool has no business touching."""
+
+    output_root = tmp_path / "wordstat-output"
+    run_directory = output_root / "runs" / "20260821T000000Z-test"
+    run_directory.mkdir(parents=True)
+
+    # Outside output_root entirely — mirrors a stray download landing under
+    # the user's real ~/Downloads, unrelated to --output-dir.
+    outside_dir = tmp_path / "not-ours"
+    outside_dir.mkdir()
+    source = outside_dir / "wordstat_regions.csv"
+    source.write_text("Регион;Показов\n", encoding="cp1251")
+
+    with pytest.raises(DownloadEscapedError, match=str(source)):
+        finalize_raw(source, run_directory, WordstatView.REGIONS, keep_raw=True)
+
+    assert source.exists()
+    assert source.read_text(encoding="cp1251") == "Регион;Показов\n"
+
+    # Same guard must hold for keep_raw=False, where the naive behavior
+    # would have been an outright unlink() of the user's file.
+    with pytest.raises(DownloadEscapedError, match=str(source)):
+        finalize_raw(source, run_directory, WordstatView.REGIONS, keep_raw=False)
+
+    assert source.exists()
+
+
+def test_finalize_raw_accepts_a_source_inside_output_root_even_when_run_directory_is_elsewhere(
+    tmp_path: Path,
+) -> None:
+    """--resume-dir can point at a run_directory that is not nested under
+    --output-dir at all (see prepare_resume_directory: it never requires
+    that). A legitimate download sitting inside the batch's shared
+    downloads directory (under output_root) must still be accepted even
+    though it is not inside run_directory itself — output_root is an
+    independently allowed root, not merely a fallback derived from
+    run_directory's parents."""
+
+    output_root = tmp_path / "wordstat-output"
+    downloads_dir = output_root / ".downloads-abc123"
+    downloads_dir.mkdir(parents=True)
+    source = downloads_dir / "wordstat_regions.csv"
+    source.write_text("Регион;Показов\n", encoding="cp1251")
+
+    # An arbitrary resume directory, deliberately NOT under output_root.
+    run_directory = tmp_path / "elsewhere" / "my-resume-dir"
+    run_directory.mkdir(parents=True)
+
+    kept = finalize_raw(source, run_directory, WordstatView.REGIONS, keep_raw=True, output_root=output_root)
+
+    assert kept == run_directory / "regions.csv"
+    assert kept.exists()
+    assert not source.exists()
 
 
 def _manifest(

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import re
+import shutil
 import tempfile
 import time
 from collections.abc import Callable
@@ -15,6 +16,7 @@ from wordstat.csv_io import parse_wordstat_csv
 from wordstat.dataset_io import write_dataset
 from wordstat.errors import (
     AuthenticationRequiredError,
+    DownloadEscapedError,
     DownloadTimeoutError,
     InterfaceChangedError,
     InvalidRequestError,
@@ -189,7 +191,20 @@ class WordstatCollector:
     async def collect(
         self, phrase: str, region: str = "Россия", resume_directory: Path | None = None
     ) -> CollectionResult:
-        """Collect popular, related, dynamics and regional reports for one phrase."""
+        """Collect popular, related, dynamics and regional reports for one phrase.
+
+        Contract change (issue #27): a phrase that collected at least one
+        view but not all four (e.g. regions failed after top_popular/
+        top_related/dynamics already succeeded) no longer raises here. Per
+        _collect_one, that case now comes back from collect_many as a
+        result, not a failure — this method's ``if batch.failures`` branch
+        therefore only fires when *zero* views were collected for the
+        phrase (see _collect_one's own guard) or the session's
+        authentication was lost. A caller that needs to know whether every
+        view was collected must inspect the returned result's
+        ``manifest.missing_views``/``view_errors``, not rely on this method
+        raising for a partial run the way it used to.
+        """
 
         batch = await self.collect_many([phrase], region=region, resume_directory=resume_directory)
         if batch.failures:
@@ -402,6 +417,33 @@ class WordstatCollector:
                     manifest_path=manifest_path,
                     manifest=manifest,
                 )
+            # Cycle-review follow-up to issue #27: views_to_collect() treats a
+            # view as pending when its <view>.parquet is missing from disk,
+            # even if manifest.exports still has an ExportSummary for it (the
+            # file was manually deleted after a prior run, or a previous
+            # resume's write_manifest happened but the file write that should
+            # have preceded it did not — see write_dataset/finalize_raw
+            # ordering). Until this view is re-collected below, its stale
+            # export entry must not stay in manifest.exports: missing_views is
+            # a computed field derived only from exports (see
+            # CollectionManifest), so an unpruned stale entry makes
+            # missing_views silently omit a view whose data file does not
+            # exist. Pruned *before* the loop attempts to re-collect it (not
+            # only on a failed retry) so a crash/Ctrl-C mid-retry still leaves
+            # an honest manifest, consistent with this method's existing
+            # "write after every step, never lie about what's on disk"
+            # invariant. A successful re-collection below overwrites this via
+            # merge_export as usual; nothing here disturbs a view that is not
+            # in pending_views.
+            stale_pending = {view for view in pending_views if any(e.view == view for e in manifest.exports)}
+            if stale_pending:
+                manifest = manifest.model_copy(
+                    update={
+                        "exports": [e for e in manifest.exports if e.view not in stale_pending],
+                        "updated_at": datetime.now(UTC),
+                    }
+                )
+                write_manifest(manifest_path, manifest)
         else:
             run_directory = create_run_directory(self.output_root, phrase)
             manifest = None
@@ -476,84 +518,148 @@ class WordstatCollector:
             manifest = manifest.model_copy(update={"source_url": await page.get_url(), "updated_at": datetime.now(UTC)})
             write_manifest(manifest_path, manifest)
 
-        for view in pending_views:
-            selector = VIEW_SELECTORS[view]
-            await self._select_view(page, selector, view)
-            # The live UI can expose the first table row before the export
-            # blob has been rebuilt for the selected phrase/view. A short
-            # settling interval prevents a header-only CSV from racing the
-            # table repaint; the structural row gate above remains required.
-            if view is not WordstatView.REGIONS and self.settling_seconds > 0:
-                await asyncio.sleep(self.settling_seconds)
-            if view is WordstatView.DYNAMICS and (
-                granularity is not Granularity.MONTHLY or date_from is not None
-            ):
-                await self._set_granularity(page, granularity)
-                if date_from is not None:
-                    await self._set_period(page, granularity, date_from, date_to)
-            source = await self._download_current_view(page, session, downloads_path)
+        # issue #27: a failure on one view (e.g. the live escaped-download
+        # race on regions, or any other InterfaceChangedError/parse failure)
+        # used to propagate straight out of _collect_one, which collect_many
+        # then recorded as a whole-phrase PhraseFailure — discarding the
+        # other views this same phrase had already collected and written to
+        # disk. view_errors accumulates a message per failed view; the loop
+        # then `break`s instead of continuing to the next view, because a
+        # view that failed mid-select/download/parse can leave the page in
+        # an unpredictable state (stuck popup, half-applied granularity,
+        # ...) that later views should not be attempted against blindly.
+        # AuthenticationRequiredError is the one exception NOT caught here:
+        # it means the whole session is gone, not just this view, and must
+        # keep propagating so collect_many's per-phrase try/except still
+        # sees it and breaks the batch (see that method's own comment on
+        # why it must be checked before the generic Exception branch).
+        view_errors: dict[WordstatView, str] = {}
+        escaped_download_warnings: list[str] = []
+        last_view_error: Exception | None = None
+        for view_index, view in enumerate(pending_views):
             try:
-                # Convert before disposing of the download, so a parse or
-                # write failure leaves the raw CSV on disk to inspect. The
-                # live export blob can lag the table repaint once; retry an
-                # empty table export once before failing closed.
-                dataset = parse_wordstat_csv(source, view)
-                if _is_untrustworthy_empty_export(view, dataset):
-                    if self.empty_export_retry_seconds > 0:
-                        await asyncio.sleep(self.empty_export_retry_seconds)
-                    source = await self._download_current_view(page, session, downloads_path)
+                selector = VIEW_SELECTORS[view]
+                await self._select_view(page, selector, view)
+                # The live UI can expose the first table row before the export
+                # blob has been rebuilt for the selected phrase/view. A short
+                # settling interval prevents a header-only CSV from racing the
+                # table repaint; the structural row gate above remains required.
+                if view is not WordstatView.REGIONS and self.settling_seconds > 0:
+                    await asyncio.sleep(self.settling_seconds)
+                if view is WordstatView.DYNAMICS and (
+                    granularity is not Granularity.MONTHLY or date_from is not None
+                ):
+                    await self._set_granularity(page, granularity)
+                    if date_from is not None:
+                        await self._set_period(page, granularity, date_from, date_to)
+                source, escape_warning = await self._download_current_view(page, session, downloads_path)
+                if escape_warning is not None:
+                    escaped_download_warnings.append(f"[{view.value}] {escape_warning}")
+                try:
+                    # Convert before disposing of the download, so a parse or
+                    # write failure leaves the raw CSV on disk to inspect. The
+                    # live export blob can lag the table repaint once; retry an
+                    # empty table export once before failing closed.
                     dataset = parse_wordstat_csv(source, view)
-                if _is_untrustworthy_empty_export(view, dataset):
-                    raise InterfaceChangedError(
-                        f"Wordstat returned an empty {view.value} CSV after a retry, but the page had rendered "
-                        "at least one table row before the download was triggered; export is not trustworthy"
+                    if _is_untrustworthy_empty_export(view, dataset):
+                        if self.empty_export_retry_seconds > 0:
+                            await asyncio.sleep(self.empty_export_retry_seconds)
+                        source, escape_warning = await self._download_current_view(page, session, downloads_path)
+                        if escape_warning is not None:
+                            escaped_download_warnings.append(f"[{view.value}] {escape_warning}")
+                        dataset = parse_wordstat_csv(source, view)
+                    if _is_untrustworthy_empty_export(view, dataset):
+                        raise InterfaceChangedError(
+                            f"Wordstat returned an empty {view.value} CSV after a retry, but the page had "
+                            "rendered at least one table row before the download was triggered; export is "
+                            "not trustworthy"
+                        )
+                    if view is WordstatView.DYNAMICS:
+                        self._assert_contiguous_dynamics_rows(
+                            dataset, granularity, date_from=date_from, date_to=date_to
+                        )
+                    file_name = self._dynamics_file_name(granularity) if view is WordstatView.DYNAMICS else None
+                    if file_name is None:
+                        data_path, dtypes = write_dataset(dataset, run_directory)
+                    else:
+                        data_path, dtypes = write_dataset(dataset, run_directory, file_name=file_name)
+                    raw_path = finalize_raw(
+                        source, run_directory, view, self.keep_raw, output_root=self.output_root
                     )
-                if view is WordstatView.DYNAMICS:
-                    self._assert_contiguous_dynamics_rows(
-                        dataset, granularity, date_from=date_from, date_to=date_to
-                    )
-                file_name = self._dynamics_file_name(granularity) if view is WordstatView.DYNAMICS else None
-                if file_name is None:
-                    data_path, dtypes = write_dataset(dataset, run_directory)
-                else:
-                    data_path, dtypes = write_dataset(dataset, run_directory, file_name=file_name)
-                raw_path = finalize_raw(source, run_directory, view, self.keep_raw)
-            except Exception:  # noqa: BLE001
-                # source lives in the batch's shared, temporary downloads
-                # directory; it would otherwise vanish with that directory
-                # once the batch finishes. Rescue it into this phrase's own
-                # run directory for any failure past this point (parsing,
-                # dtype inference, the parquet write itself), not just
-                # CsvFormatError, so "the CSV stays on disk to inspect" holds
-                # regardless of which step failed.
-                if source.exists():
-                    source.replace(run_directory / source.name)
-                raise
-            if view != WordstatView.REGIONS:
-                self._previous_table_snapshot = await self._table_snapshot(page)
-            export = ExportSummary(
-                view=view,
-                file=data_path.name,
-                raw_file=raw_path.name if raw_path else None,
-                row_count=len(dataset.rows),
-                dtypes=dtypes,
-            )
-            # Rewritten after every view, not just once at the end: an
-            # interruption between views must leave a manifest that honestly
-            # reflects the views collected so far (see write_manifest and
-            # CollectionManifest.status), not a stale one still claiming
-            # every view is missing.
-            manifest = merge_export(manifest, export)
-            if view is WordstatView.DYNAMICS:
-                manifest = manifest.model_copy(
-                    update={"actual_period": self._actual_period(dataset)}
+                except Exception:  # noqa: BLE001
+                    # source lives in the batch's shared, temporary downloads
+                    # directory; it would otherwise vanish with that directory
+                    # once the batch finishes. Rescue it into this phrase's own
+                    # run directory for any failure past this point (parsing,
+                    # dtype inference, the parquet write itself), not just
+                    # CsvFormatError, so "the CSV stays on disk to inspect" holds
+                    # regardless of which step failed.
+                    # shutil.move (not Path.replace/os.rename) so this survives
+                    # source and run_directory sitting on different filesystems —
+                    # same reasoning as finalize_raw's own move. source here is
+                    # always the file _download_current_view already confirmed
+                    # lives inside downloads_path (an escaped path raises
+                    # DownloadEscapedError before source is ever bound in this
+                    # scope), so no containment check is needed on this path.
+                    if source.exists():
+                        shutil.move(str(source), str(run_directory / source.name))
+                    raise
+                if view != WordstatView.REGIONS:
+                    self._previous_table_snapshot = await self._table_snapshot(page)
+                export = ExportSummary(
+                    view=view,
+                    file=data_path.name,
+                    raw_file=raw_path.name if raw_path else None,
+                    row_count=len(dataset.rows),
+                    dtypes=dtypes,
                 )
-            write_manifest(manifest_path, manifest)
+                # Rewritten after every view, not just once at the end: an
+                # interruption between views must leave a manifest that honestly
+                # reflects the views collected so far (see write_manifest and
+                # CollectionManifest.status), not a stale one still claiming
+                # every view is missing.
+                manifest = merge_export(manifest, export)
+                if view is WordstatView.DYNAMICS:
+                    manifest = manifest.model_copy(
+                        update={"actual_period": self._actual_period(dataset)}
+                    )
+                write_manifest(manifest_path, manifest)
+            except AuthenticationRequiredError:
+                raise
+            except Exception as error:  # noqa: BLE001 - per-view isolation is intentional, see comment above
+                view_errors[view] = f"{type(error).__name__}: {error}"
+                last_view_error = error
+                # Every view after this one was never attempted at all (the
+                # loop breaks, see the comment above this loop) — record
+                # that explicitly instead of leaving them silently absent
+                # from both exports and view_errors. Without this, the CLI
+                # (which falls back to "не собран" for any view in
+                # missing_views with no view_errors entry) would print the
+                # same message for "we tried and it genuinely failed" and
+                # "we never even attempted this view", which reads as a
+                # false claim that every view was tried.
+                for skipped_view in pending_views[view_index + 1 :]:
+                    view_errors[skipped_view] = f"не пробовался: сбой на виде {view.value}"
+                break
+
+        if last_view_error is not None and not manifest.exports:
+            # Nothing at all was collected for this phrase (the very first
+            # attempted view already failed, or a --resume-dir run whose
+            # only remaining view just failed too) — this must still surface
+            # as a failure, not a "partial success" CollectionResult with
+            # zero exports. Without this guard, collect_many would count a
+            # completely failed phrase in batch.results, and the CLI would
+            # report it as collected. Re-raises the original exception type/
+            # message (not a generic wrapper) so collect_many's per-phrase
+            # except still records the real cause in PhraseFailure.error.
+            raise last_view_error
 
         return CollectionResult(
             run_directory=run_directory,
             manifest_path=manifest_path,
             manifest=manifest,
+            view_errors=view_errors,
+            escaped_download_warnings=escaped_download_warnings,
         )
 
     @staticmethod
@@ -1014,13 +1120,33 @@ class WordstatCollector:
             f"() => document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.textContent ?? null"
         )
 
-    async def _download_current_view(self, page, session: BrowserSession, downloads_path: Path) -> Path:
+    async def _download_current_view(
+        self, page, session: BrowserSession, downloads_path: Path
+    ) -> tuple[Path, str | None]:
+        """Download the CSV for the currently selected view.
+
+        Returns ``(path, escape_warning)``. ``escape_warning`` is ``None`` on
+        the common path; it carries a message when a stray escaped download
+        (see ``DownloadEscapedError`` below) was observed in the very same
+        poll tick as the legitimate CSV (issue #27 follow-up). That case
+        must not fail the view — the view's own CSV is fine and already on
+        disk — but the operator still needs to know Chrome dropped a file
+        outside ``downloads_path`` somewhere. Checking ``new_escaped`` only
+        applies when no legitimate CSV was found in this tick would silently
+        lose that signal forever: ``session.downloaded_files`` is
+        session-lifetime and append-only, so the same path is already inside
+        next call's ``before_escaped`` baseline and would never show up in a
+        future ``new_escaped`` diff either — this is not a "check it next
+        time" gap, the escape is gone from view for good once masked by a
+        same-tick success.
+        """
         # macOS resolves /tmp to /private/tmp; the downloads directory and
         # session.downloaded_files can report the same physical file under
         # different unresolved paths, which would otherwise look like two
         # distinct downloads. Compare resolved paths, keep the original for
         # return.
         before = self._resolved_file_snapshot(downloads_path, session)
+        before_escaped = self._escaped_download_paths(downloads_path, session)
         # "Скачать" now opens a format menu (CSV / XLSX) instead of downloading
         # directly; a second click on the CSV entry is required.
         await self._click(page, DOWNLOAD_SELECTOR)
@@ -1033,10 +1159,64 @@ class WordstatCollector:
             current = self._resolved_file_snapshot(downloads_path, session)
             new_resolved = set(current) - set(before)
             csv_files = [current[resolved] for resolved in new_resolved if resolved.suffix.lower() == ".csv"]
+            # Evaluated every tick, including the one that finds the
+            # legitimate CSV: a stray escaped path can land in the exact
+            # same tick as a good download, and (per the docstring above)
+            # that escape would never be detected on any later call either
+            # once masked here — this is the only tick in which it is ever
+            # observable at all.
+            new_escaped = self._escaped_download_paths(downloads_path, session) - before_escaped
+            escape_warning = (
+                "Chrome reported a download outside the run's downloads directory "
+                f"({downloads_path}): {sorted(str(path) for path in new_escaped)}. "
+                "The file was left untouched; it is not safe to move or delete "
+                "automatically. Move it manually if it belongs to this run."
+                if new_escaped
+                else None
+            )
             if len(csv_files) == 1 and csv_files[0].stat().st_size > 0:
-                return csv_files[0]
+                # The view's own download succeeded — a stray escape seen in
+                # this same tick is reported as a warning, not a failure: the
+                # data this view needed is safely on disk, and raising here
+                # would discard it for no reason (see the docstring above for
+                # why this is the only chance to report the escape at all).
+                return csv_files[0], escape_warning
             if len(csv_files) > 1:
                 raise DownloadTimeoutError("Wordstat produced more than one new CSV for a single export")
+            # Chrome can report a download at a path outside downloads_path
+            # despite Browser.setDownloadBehavior having been configured for
+            # this session (issue #27 — observed live on the fourth view of a
+            # phrase, landing under the real ~/Downloads). Root-cause
+            # investigated live (CDP :9223, issue #27 fix): every table
+            # view's export link is `a[download]` with an `href="blob:..."`
+            # and `target="_self"` — DYNAMICS and REGIONS are structurally
+            # identical on this point (dumped both live), so a per-target
+            # blob/`_self` explanation was ruled out; browser-use's own
+            # Browser.setDownloadBehavior call (downloads_watchdog.py) is
+            # also browser-level, not per-target, so it should not degrade
+            # between views either. Several live full 4-view runs (single
+            # phrase and a 2-phrase batch, both with --keep-raw, one against
+            # --output-dir inside the repo and one outside it) all completed
+            # cleanly with every file landing inside downloads_path — the
+            # escape did not reproduce on demand, meaning it's an
+            # intermittent Chrome-side race (not deterministically tied to
+            # "the fourth view" or any specific view), not a bug in how this
+            # collector configures downloads_path. So this containment check
+            # can't be "fixed away" upstream; treating the intermittent
+            # escape as an honest, loud failure instead of a silent
+            # mistargeted move/delete is the correct and sufficient fix. This
+            # is never treated as "the" download for this view — that file
+            # is not ours to move or delete (it may not even be from this
+            # run) — but it must fail loudly and specifically instead of a
+            # generic DownloadTimeoutError that leaves the operator guessing
+            # whether Wordstat ever produced anything at all.
+            if new_escaped:
+                raise DownloadEscapedError(
+                    "Chrome reported a download outside the run's downloads directory "
+                    f"({downloads_path}): {sorted(str(path) for path in new_escaped)}. "
+                    "The file was left untouched; it is not safe to move or delete "
+                    "automatically. Move it manually if it belongs to this run."
+                )
             await asyncio.sleep(0.25)
         raise DownloadTimeoutError("Wordstat did not produce a CSV before the download timeout")
 
@@ -1102,7 +1282,42 @@ class WordstatCollector:
         file that appears under two unresolved forms (e.g. /tmp vs
         /private/tmp on macOS) between downloads-directory globbing and
         session.downloaded_files.
+
+        session.downloaded_files (issue #27) is browser-use's own
+        session-lifetime log of every CDP downloadWillBegin/downloadProgress
+        event, not a list scoped to this collector's downloads_path — it can
+        legitimately (or by a Chrome quirk not yet root-caused, see
+        _download_current_view's docstring) name a path outside directory
+        entirely, or a path inside a downloads directory from an earlier,
+        already-cleaned-up phrase in the same batch. Filtering it down to
+        paths resolving under directory keeps the escaped-path case fully
+        out of this snapshot instead of letting set difference "detect" it
+        as a legitimate new download — the escape is instead surfaced
+        explicitly by _download_current_view below.
         """
+        resolved_directory = directory.resolve()
         paths = {path for path in directory.glob("*") if path.is_file()}
-        paths |= {Path(path) for path in session.downloaded_files}
+        for reported in session.downloaded_files:
+            candidate = Path(reported)
+            if candidate.exists() and candidate.resolve().is_relative_to(resolved_directory):
+                paths.add(candidate)
         return {path.resolve(): path for path in paths if path.exists()}
+
+    @staticmethod
+    def _escaped_download_paths(directory: Path, session: BrowserSession) -> set[Path]:
+        """Paths session.downloaded_files reports that fall outside directory.
+
+        A companion to _resolved_file_snapshot: that method silently drops
+        these paths from its result so they are never mistaken for our own
+        download, but _download_current_view still needs to know they exist
+        in order to fail loudly (DownloadEscapedError) instead of just timing
+        out with a confusing "no CSV appeared" when Chrome in fact downloaded
+        something, just not where it was told to.
+        """
+        resolved_directory = directory.resolve()
+        escaped = set()
+        for reported in session.downloaded_files:
+            candidate = Path(reported)
+            if candidate.exists() and not candidate.resolve().is_relative_to(resolved_directory):
+                escaped.add(candidate)
+        return escaped

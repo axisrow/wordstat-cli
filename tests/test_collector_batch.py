@@ -13,7 +13,13 @@ import pytest
 
 import wordstat.collector as collector_module
 from wordstat.collector import WordstatCollector
-from wordstat.errors import AuthenticationRequiredError, InvalidRequestError, PhraseEntryError, ResumeMismatchError
+from wordstat.errors import (
+    AuthenticationRequiredError,
+    DownloadTimeoutError,
+    InvalidRequestError,
+    PhraseEntryError,
+    ResumeMismatchError,
+)
 from wordstat.models import CollectionManifest, CollectionResult, WordstatView
 from wordstat.storage import load_manifest
 
@@ -445,7 +451,7 @@ def test_collect_one_preserves_a_table_snapshot_for_the_next_phrase(monkeypatch,
         download_count += 1
         source = directory / f"export-{download_count}.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     monkeypatch.setattr(WordstatCollector, "_assert_authenticated", noop)
     monkeypatch.setattr(WordstatCollector, "_set_phrase", noop)
@@ -490,7 +496,7 @@ def test_collect_one_rescues_the_csv_into_the_run_directory_on_write_failure(mon
         call_count["n"] += 1
         source = dl_path / f"export-{call_count['n']}.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     def failing_write_dataset(dataset, run_directory):
         raise RuntimeError("simulated pyarrow.ArrowInvalid")
@@ -533,7 +539,7 @@ def test_collect_one_rescue_does_not_error_when_finalize_raw_already_moved_the_f
     async def fake_download(self, page, session, dl_path):
         source = dl_path / "export.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     view_calls = {"n": 0}
 
@@ -556,11 +562,191 @@ def test_collect_one_rescue_does_not_error_when_finalize_raw_already_moved_the_f
     async def run():
         page = _FakePage()
         session = _FakeSession()
-        with pytest.raises(RuntimeError, match="second view fails"):
+        return await collector._collect_one(page, session, downloads_path, "тест", "Россия")
+
+    # Issue #27: the first view already succeeded, so this is now a partial
+    # result (not a raised exception) — the rescue must still not raise a
+    # FileNotFoundError on top of the second view's original RuntimeError,
+    # which is what this test guards; that message now surfaces through
+    # view_errors (the failed view) instead of propagating out of
+    # _collect_one. The two views after it were never attempted (the loop
+    # breaks) and get their own distinct "не пробовался" entries.
+    result = asyncio.run(run())
+    assert len(result.view_errors) == 3
+    assert "second view fails" in result.view_errors[WordstatView.TOP_RELATED]
+    for never_attempted in (WordstatView.DYNAMICS, WordstatView.REGIONS):
+        assert "не пробовался" in result.view_errors[never_attempted]
+
+
+# --- issue #27: a single failing view must not fail the whole phrase -----
+
+
+def test_collect_one_returns_a_partial_result_when_one_view_fails(monkeypatch, tmp_path):
+    """3 of 4 views succeed, the 4th (regions) fails with a non-auth error
+    (DownloadTimeoutError, mirroring issue #27's live symptom). _collect_one
+    must not raise: it returns a CollectionResult whose manifest honestly
+    reports the failed view as missing, and whose view_errors carries the
+    reason — instead of the caller losing 3 successfully collected views and
+    seeing "Собрано 0 из 1" for a phrase that mostly succeeded."""
+
+    _patch_common(monkeypatch)
+
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    call_count = {"n": 0}
+
+    async def fake_download(self, page, session, dl_path):
+        call_count["n"] += 1
+        if call_count["n"] == 4:
+            raise DownloadTimeoutError("simulated: Wordstat never produced a CSV for regions")
+        source = dl_path / f"export-{call_count['n']}.csv"
+        _write_view_csv(source, "тест")
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+
+    async def run():
+        page = _FakePage()
+        session = _FakeSession()
+        return await collector._collect_one(page, session, downloads_path, "тест", "Россия")
+
+    result = asyncio.run(run())
+
+    assert result.manifest.missing_views == [WordstatView.REGIONS]
+    assert len(result.manifest.exports) == 3
+    assert result.manifest.status == "incomplete"
+    on_disk = load_manifest(result.manifest_path)
+    assert on_disk.missing_views == [WordstatView.REGIONS]
+    assert len(on_disk.exports) == 3
+    assert WordstatView.REGIONS in result.view_errors
+    assert "simulated" in result.view_errors[WordstatView.REGIONS]
+
+
+def test_collect_one_records_untried_views_after_a_non_final_view_fails(monkeypatch, tmp_path):
+    """When the 2nd of 4 views fails (not the last one), the loop breaks
+    (see the comment above the view loop) and REGIONS/whichever views come
+    after are never attempted at all — that must be recorded distinctly
+    from "this view was tried and it failed", or the CLI's fallback message
+    for a view with no view_errors entry would misreport an untried view as
+    a failure with no known cause."""
+
+    _patch_common(monkeypatch)
+
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    call_count = {"n": 0}
+
+    async def fake_download(self, page, session, dl_path):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise DownloadTimeoutError("simulated: top_related never downloaded")
+        source = dl_path / f"export-{call_count['n']}.csv"
+        _write_view_csv(source, "тест")
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+
+    async def run():
+        page = _FakePage()
+        session = _FakeSession()
+        return await collector._collect_one(page, session, downloads_path, "тест", "Россия")
+
+    result = asyncio.run(run())
+
+    assert len(result.manifest.exports) == 1  # only TOP_POPULAR, the first view
+    assert result.manifest.missing_views == [
+        WordstatView.TOP_RELATED,
+        WordstatView.DYNAMICS,
+        WordstatView.REGIONS,
+    ]
+    # The view that actually failed carries the real error...
+    assert "simulated: top_related never downloaded" in result.view_errors[WordstatView.TOP_RELATED]
+    # ...but DYNAMICS/REGIONS were never even attempted, and must say so
+    # distinctly rather than reusing the same failure message or being
+    # silently absent from view_errors altogether.
+    for never_attempted in (WordstatView.DYNAMICS, WordstatView.REGIONS):
+        assert "не пробовался" in result.view_errors[never_attempted]
+
+
+def test_collect_one_still_propagates_authentication_loss_mid_phrase(monkeypatch, tmp_path):
+    """AuthenticationRequiredError must keep propagating out of _collect_one
+    (not be swallowed into a partial result) — collect_many relies on it to
+    break the whole batch instead of retrying a dead session phrase by
+    phrase."""
+
+    _patch_common(monkeypatch)
+
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    call_count = {"n": 0}
+
+    async def fake_download(self, page, session, dl_path):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise AuthenticationRequiredError("simulated: session logged out mid-phrase")
+        source = dl_path / f"export-{call_count['n']}.csv"
+        _write_view_csv(source, "тест")
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+
+    async def run():
+        page = _FakePage()
+        session = _FakeSession()
+        with pytest.raises(AuthenticationRequiredError):
             await collector._collect_one(page, session, downloads_path, "тест", "Россия")
 
-    # Must raise the original RuntimeError, not a FileNotFoundError from the
-    # rescue trying to move an already-moved file.
+    asyncio.run(run())
+
+
+def test_collect_one_raises_when_every_view_fails(monkeypatch, tmp_path):
+    """A phrase where nothing at all was collected must not come back as a
+    "partial success" CollectionResult with zero exports — that would let
+    the CLI count an entirely failed phrase as collected."""
+
+    _patch_common(monkeypatch)
+
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    async def fake_download(self, page, session, dl_path):
+        raise DownloadTimeoutError("simulated: nothing ever downloads")
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+
+    async def run():
+        page = _FakePage()
+        session = _FakeSession()
+        with pytest.raises(DownloadTimeoutError):
+            await collector._collect_one(page, session, downloads_path, "тест", "Россия")
+
     asyncio.run(run())
 
 
@@ -586,7 +772,7 @@ def test_collect_one_writes_the_manifest_after_every_view_not_only_at_the_end(mo
         call_count["n"] += 1
         source = dl_path / f"export-{call_count['n']}.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     seen_statuses = []
     real_write_manifest = collector_module.write_manifest
@@ -647,7 +833,7 @@ def test_collect_one_resume_directory_only_collects_missing_views(monkeypatch, t
             raise RuntimeError("simulated interruption")
         source = dl_path / "export-1.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
     monkeypatch.setattr(WordstatCollector, "_download_current_view", failing_after_first_download)
@@ -657,10 +843,14 @@ def test_collect_one_resume_directory_only_collects_missing_views(monkeypatch, t
     async def run_first():
         page = _FakePage()
         session = _FakeSession()
-        with pytest.raises(RuntimeError, match="simulated interruption"):
-            await collector._collect_one(page, session, downloads_path, "тест", "Россия")
+        return await collector._collect_one(page, session, downloads_path, "тест", "Россия")
 
-    asyncio.run(run_first())
+    # Issue #27: one view succeeding before another fails is now a partial
+    # result, not a raised exception (see _collect_one's view_errors guard —
+    # it only re-raises when *no* view was collected at all).
+    first_result = asyncio.run(run_first())
+    assert WordstatView.TOP_RELATED in first_result.view_errors
+    assert "simulated interruption" in first_result.view_errors[WordstatView.TOP_RELATED]
 
     run_directories = [p for p in tmp_path.glob("runs/*") if p.is_dir()]
     assert len(run_directories) == 1
@@ -677,7 +867,7 @@ def test_collect_one_resume_directory_only_collects_missing_views(monkeypatch, t
         call_count["n"] += 1
         source = dl_path / f"resume-{call_count['n']}.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     monkeypatch.setattr(WordstatCollector, "_download_current_view", succeeding_download)
 
@@ -701,6 +891,75 @@ def test_collect_one_resume_directory_only_collects_missing_views(monkeypatch, t
     assert (run_directory / still_there.file).stat().st_mtime == first_view_mtime
 
 
+def test_collect_one_resume_prunes_stale_export_when_parquet_is_missing_and_retry_fails(monkeypatch, tmp_path):
+    """Cycle-review follow-up to issue #27 (round 2): views_to_collect()
+    re-attempts a view whose <view>.parquet is missing from disk even though
+    manifest.exports still has a stale ExportSummary for it (e.g. the file
+    was manually deleted after a prior run). If that re-attempt then fails
+    too, the stale export entry must have been pruned from manifest.exports
+    up front — otherwise missing_views (computed from exports only) falsely
+    reports nothing missing for a view whose data file does not exist, and a
+    programmatic manifest consumer gets a false "this view is fine" signal."""
+
+    _patch_common(monkeypatch)
+
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+
+    async def succeeding_download(self, page, session, dl_path):
+        source = dl_path / "export.csv"
+        _write_view_csv(source, "тест")
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", succeeding_download)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+
+    async def run_first():
+        page = _FakePage()
+        session = _FakeSession()
+        return await collector._collect_one(page, session, downloads_path, "тест", "Россия")
+
+    first_result = asyncio.run(run_first())
+    assert not first_result.view_errors  # all 4 views collected cleanly
+    run_directory = first_result.run_directory
+    full_manifest = load_manifest(run_directory / "manifest.json")
+    assert full_manifest.status == "complete"
+
+    # Simulate a manually-deleted parquet: the manifest still names it in
+    # exports, but the file itself is gone from disk.
+    regions_export = next(e for e in full_manifest.exports if e.view == WordstatView.REGIONS)
+    (run_directory / regions_export.file).unlink()
+
+    # Resume, and this time make the re-attempted view's download fail.
+    async def failing_download(self, page, session, dl_path):
+        raise DownloadTimeoutError("simulated: regions re-collection failed on resume")
+
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", failing_download)
+
+    async def run_resume():
+        page = _FakePage()
+        session = _FakeSession()
+        return await collector._collect_one(
+            page, session, downloads_path, "тест", "Россия", resume_directory=run_directory
+        )
+
+    result = asyncio.run(run_resume())
+
+    # The stale export entry must be gone: missing_views must name REGIONS,
+    # not silently omit it because a stale exports entry survived.
+    assert WordstatView.REGIONS in result.manifest.missing_views
+    assert WordstatView.REGIONS in result.view_errors
+    on_disk = load_manifest(run_directory / "manifest.json")
+    assert WordstatView.REGIONS in on_disk.missing_views
+    assert not any(e.view == WordstatView.REGIONS for e in on_disk.exports)
+
+
 def test_collect_one_resume_directory_rejects_a_different_phrase(monkeypatch, tmp_path):
     _patch_common(monkeypatch)
 
@@ -713,7 +972,7 @@ def test_collect_one_resume_directory_rejects_a_different_phrase(monkeypatch, tm
     async def fake_download(self, page, session, dl_path):
         source = dl_path / "export.csv"
         _write_view_csv(source, "чай")
-        return source
+        return source, None
 
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
     monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
@@ -795,7 +1054,7 @@ def test_collect_one_resume_updates_source_url_and_updated_at_but_not_created_at
     async def succeeding_download(self, page, session, dl_path):
         source = dl_path / "export.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     monkeypatch.setattr(WordstatCollector, "_download_current_view", succeeding_download)
 
@@ -843,7 +1102,7 @@ def test_collect_one_resume_of_an_already_complete_run_does_not_touch_the_manife
     async def fake_download(self, page, session, dl_path):
         source = dl_path / "export.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
     monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)

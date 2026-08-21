@@ -2,11 +2,12 @@
 
 import os
 import re
+import shutil
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
-from wordstat.errors import ResumeMismatchError
+from wordstat.errors import DownloadEscapedError, ResumeMismatchError
 from wordstat.models import CollectionManifest, ExportSummary, WordstatView
 
 
@@ -32,19 +33,59 @@ def slugify(value: str) -> str:
     return compact[:64] or "query"
 
 
-def finalize_raw(source: Path, run_directory: Path, view: WordstatView, keep_raw: bool) -> Path | None:
+def finalize_raw(
+    source: Path, run_directory: Path, view: WordstatView, keep_raw: bool, output_root: Path | None = None
+) -> Path | None:
     """Dispose of a download once it has been converted to Parquet.
 
     By default the raw CSV is removed, leaving only the converted datasets in
     the run directory.  With ``keep_raw`` it is renamed to the view's canonical
     name so it sits next to its ``<view>.parquet`` counterpart.
+
+    Belt-and-suspenders against issue #27 (a downloaded file that ends up
+    outside the tool's own downloads_path, e.g. under the user's real
+    ~/Downloads on macOS): a source that is not inside ``run_directory``
+    itself, nor inside ``output_root`` (the batch's shared temporary
+    downloads directory lives under it — see ``collector.collect_many``), is
+    refused outright with ``DownloadEscapedError`` instead of being moved or
+    deleted. ``output_root`` is a caller-supplied parameter rather than
+    inferred from ``run_directory``'s parents: under ``--resume-dir``,
+    ``run_directory`` can be an arbitrary user-supplied path that is not
+    necessarily two levels under ``--output-dir`` at all, and inferring it
+    would either reject a legitimate download or (worse) widen the allowed
+    zone unpredictably. Callers that have no ``output_root`` to pass (e.g.
+    existing tests that only care about the rename/delete behavior) may omit
+    it, in which case only ``run_directory`` is treated as safe. This is a
+    second line of defense — collector.py's ``_download_current_view``
+    already refuses to hand such a path to this function at all — kept here
+    in case any future caller reaches this function directly with an
+    unchecked path. Checked before the ``missing_ok`` unlink path too: a
+    caller passing ``keep_raw=False`` for a stray path must not silently
+    delete a file that does not belong to this run.
     """
+
+    resolved_source = source.resolve()
+    allowed_roots = [run_directory.resolve()]
+    if output_root is not None:
+        allowed_roots.append(output_root.resolve())
+    if source.exists() and not any(resolved_source.is_relative_to(root) for root in allowed_roots):
+        raise DownloadEscapedError(
+            f"Refusing to move or delete {source} — it is outside the run "
+            f"directory ({run_directory}) and its output root ({output_root}); "
+            "it is not safe to assume this tool owns that file."
+        )
 
     if not keep_raw:
         source.unlink(missing_ok=True)
         return None
     destination = run_directory / f"{view.value}.csv"
-    return source.replace(destination)
+    # shutil.move tries an atomic os.rename first and only falls back to a
+    # copy+unlink when source/destination sit on different filesystems (e.g.
+    # --output-dir on a different mount than the batch's shared downloads
+    # directory) — Path.replace (bare os.rename) raises OSError in that case
+    # instead of relocating the file.
+    shutil.move(str(source), str(destination))
+    return destination
 
 
 def write_manifest(path: Path, manifest: CollectionManifest) -> None:
