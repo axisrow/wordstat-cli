@@ -337,6 +337,15 @@ class WordstatCollector:
                 # Convert before disposing of the download, so a parse or
                 # write failure leaves the raw CSV on disk to inspect.
                 dataset = parse_wordstat_csv(source, view)
+                if view in (WordstatView.TOP_POPULAR, WordstatView.TOP_RELATED) and not dataset.rows:
+                    rendered_rows = await page.evaluate(
+                        f"() => document.querySelectorAll({json.dumps(TABLE_ROW_SELECTOR)}).length"
+                    )
+                    if int(rendered_rows) > 0:
+                        raise InterfaceChangedError(
+                            f"Wordstat returned an empty {view.value} CSV while the page rendered "
+                            f"{rendered_rows} table rows; export is not trustworthy"
+                        )
                 data_path, dtypes = write_dataset(dataset, run_directory)
                 raw_path = finalize_raw(source, run_directory, view, self.keep_raw)
             except Exception:  # noqa: BLE001
