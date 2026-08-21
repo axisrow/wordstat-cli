@@ -417,6 +417,33 @@ class WordstatCollector:
                     manifest_path=manifest_path,
                     manifest=manifest,
                 )
+            # Cycle-review follow-up to issue #27: views_to_collect() treats a
+            # view as pending when its <view>.parquet is missing from disk,
+            # even if manifest.exports still has an ExportSummary for it (the
+            # file was manually deleted after a prior run, or a previous
+            # resume's write_manifest happened but the file write that should
+            # have preceded it did not — see write_dataset/finalize_raw
+            # ordering). Until this view is re-collected below, its stale
+            # export entry must not stay in manifest.exports: missing_views is
+            # a computed field derived only from exports (see
+            # CollectionManifest), so an unpruned stale entry makes
+            # missing_views silently omit a view whose data file does not
+            # exist. Pruned *before* the loop attempts to re-collect it (not
+            # only on a failed retry) so a crash/Ctrl-C mid-retry still leaves
+            # an honest manifest, consistent with this method's existing
+            # "write after every step, never lie about what's on disk"
+            # invariant. A successful re-collection below overwrites this via
+            # merge_export as usual; nothing here disturbs a view that is not
+            # in pending_views.
+            stale_pending = {view for view in pending_views if any(e.view == view for e in manifest.exports)}
+            if stale_pending:
+                manifest = manifest.model_copy(
+                    update={
+                        "exports": [e for e in manifest.exports if e.view not in stale_pending],
+                        "updated_at": datetime.now(UTC),
+                    }
+                )
+                write_manifest(manifest_path, manifest)
         else:
             run_directory = create_run_directory(self.output_root, phrase)
             manifest = None

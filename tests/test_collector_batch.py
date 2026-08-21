@@ -891,6 +891,75 @@ def test_collect_one_resume_directory_only_collects_missing_views(monkeypatch, t
     assert (run_directory / still_there.file).stat().st_mtime == first_view_mtime
 
 
+def test_collect_one_resume_prunes_stale_export_when_parquet_is_missing_and_retry_fails(monkeypatch, tmp_path):
+    """Cycle-review follow-up to issue #27 (round 2): views_to_collect()
+    re-attempts a view whose <view>.parquet is missing from disk even though
+    manifest.exports still has a stale ExportSummary for it (e.g. the file
+    was manually deleted after a prior run). If that re-attempt then fails
+    too, the stale export entry must have been pruned from manifest.exports
+    up front — otherwise missing_views (computed from exports only) falsely
+    reports nothing missing for a view whose data file does not exist, and a
+    programmatic manifest consumer gets a false "this view is fine" signal."""
+
+    _patch_common(monkeypatch)
+
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+
+    async def succeeding_download(self, page, session, dl_path):
+        source = dl_path / "export.csv"
+        _write_view_csv(source, "тест")
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", succeeding_download)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+
+    async def run_first():
+        page = _FakePage()
+        session = _FakeSession()
+        return await collector._collect_one(page, session, downloads_path, "тест", "Россия")
+
+    first_result = asyncio.run(run_first())
+    assert not first_result.view_errors  # all 4 views collected cleanly
+    run_directory = first_result.run_directory
+    full_manifest = load_manifest(run_directory / "manifest.json")
+    assert full_manifest.status == "complete"
+
+    # Simulate a manually-deleted parquet: the manifest still names it in
+    # exports, but the file itself is gone from disk.
+    regions_export = next(e for e in full_manifest.exports if e.view == WordstatView.REGIONS)
+    (run_directory / regions_export.file).unlink()
+
+    # Resume, and this time make the re-attempted view's download fail.
+    async def failing_download(self, page, session, dl_path):
+        raise DownloadTimeoutError("simulated: regions re-collection failed on resume")
+
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", failing_download)
+
+    async def run_resume():
+        page = _FakePage()
+        session = _FakeSession()
+        return await collector._collect_one(
+            page, session, downloads_path, "тест", "Россия", resume_directory=run_directory
+        )
+
+    result = asyncio.run(run_resume())
+
+    # The stale export entry must be gone: missing_views must name REGIONS,
+    # not silently omit it because a stale exports entry survived.
+    assert WordstatView.REGIONS in result.manifest.missing_views
+    assert WordstatView.REGIONS in result.view_errors
+    on_disk = load_manifest(run_directory / "manifest.json")
+    assert WordstatView.REGIONS in on_disk.missing_views
+    assert not any(e.view == WordstatView.REGIONS for e in on_disk.exports)
+
+
 def test_collect_one_resume_directory_rejects_a_different_phrase(monkeypatch, tmp_path):
     _patch_common(monkeypatch)
 
