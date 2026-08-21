@@ -326,9 +326,7 @@ class WordstatCollector:
             # Doing this after _set_phrase (not before) is required: the
             # page is still on the previous phrase/tab until _set_phrase
             # returns.
-            manifest = manifest.model_copy(
-                update={"source_url": await page.get_url(), "updated_at": datetime.now(UTC)}
-            )
+            manifest = manifest.model_copy(update={"source_url": await page.get_url(), "updated_at": datetime.now(UTC)})
             write_manifest(manifest_path, manifest)
 
         for view in pending_views:
@@ -360,7 +358,6 @@ class WordstatCollector:
                 raw_file=raw_path.name if raw_path else None,
                 row_count=len(dataset.rows),
                 dtypes=dtypes,
-            )
             )
             # Rewritten after every view, not just once at the end: an
             # interruption between views must leave a manifest that honestly
