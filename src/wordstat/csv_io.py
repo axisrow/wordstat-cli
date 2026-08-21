@@ -1,4 +1,8 @@
-"""CSV decoding for Wordstat downloads."""
+"""CSV decoding for Wordstat downloads.
+
+Wordstat exports are commonly UTF-8 with a BOM and may use a lone CR as the
+line terminator.  ``cp1251`` remains a supported fallback for older exports.
+"""
 
 import csv
 from collections.abc import Iterable
@@ -8,6 +12,15 @@ from wordstat.errors import CsvFormatError
 from wordstat.models import CsvDataset, WordstatView
 
 _ENCODINGS = ("utf-8-sig", "utf-8", "cp1251")
+
+
+class _FallbackDialect(csv.excel):
+    """Fallback dialect for a Wordstat separator Sniffer couldn't confirm."""
+
+    delimiter = ";"
+
+
+_FALLBACK_DELIMITERS = (";", "\t")
 
 
 def parse_wordstat_csv(path: Path, view: WordstatView) -> CsvDataset:
@@ -40,11 +53,32 @@ def _read_text(path: Path) -> str:
 
 
 def _detect_dialect(text: str) -> csv.Dialect:
+    # Sniffer cannot establish a delimiter from a header-only export.  Do not
+    # let its Excel fallback turn commas inside a localized header into
+    # columns; Wordstat uses either semicolon or tab depending on the view
+    # (see the "Fix the CSV sniffer's tab delimiter" fix), so pick whichever
+    # of the two known separators actually appears in the header line rather
+    # than hardcoding one.
+    lines = text.splitlines()
+    if len(lines) < 2:
+        return _fallback_dialect(lines[0] if lines else "")
     sample = text[:4096]
     try:
         return csv.Sniffer().sniff(sample, delimiters=";,\t")
     except csv.Error:
-        return csv.excel
+        return _fallback_dialect(lines[0])
+
+
+def _fallback_dialect(header_line: str) -> csv.Dialect:
+    delimiter = max(_FALLBACK_DELIMITERS, key=header_line.count)
+    if header_line.count(delimiter) == 0:
+        delimiter = ";"
+
+    class _Dialect(_FallbackDialect):
+        pass
+
+    _Dialect.delimiter = delimiter
+    return _Dialect()
 
 
 def _validate_headers(fieldnames: Iterable[str | None] | None, path: Path) -> list[str]:
@@ -53,6 +87,8 @@ def _validate_headers(fieldnames: Iterable[str | None] | None, path: Path) -> li
     headers = [header.strip() if header else "" for header in fieldnames]
     if not all(headers):
         raise CsvFormatError(f"CSV {path.name} contains an empty header")
+    if any(delimiter in header for header in headers for delimiter in _FALLBACK_DELIMITERS):
+        raise CsvFormatError(f"CSV {path.name} contains an unparsed delimiter in a header")
     if len(set(headers)) != len(headers):
         raise CsvFormatError(f"CSV {path.name} contains duplicate headers")
     return headers
