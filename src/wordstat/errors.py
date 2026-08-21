@@ -27,3 +27,7 @@ class DownloadTimeoutError(WordstatError):
 
 class CsvFormatError(WordstatError):
     """A downloaded file cannot be decoded as a headed CSV report."""
+
+
+class ResumeMismatchError(WordstatError):
+    """--resume-dir does not belong to the requested phrase/region, or is unusable."""

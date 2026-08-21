@@ -8,6 +8,7 @@ import click
 from wordstat.collector import WordstatCollector
 from wordstat.config import load_config
 from wordstat.errors import WordstatError
+from wordstat.storage import prepare_resume_directory
 
 _CONFIG = load_config()
 _DEFAULT_CDP_URL = _CONFIG.get("cdp_url", "http://127.0.0.1:9222")
@@ -74,6 +75,17 @@ def _read_phrases_file(path: Path) -> str:
     default=False,
     help="Keep each downloaded CSV as <view>.csv instead of discarding it after conversion.",
 )
+@click.option(
+    "--resume-dir",
+    "resume_dir",
+    type=click.Path(path_type=Path, exists=True, file_okay=False),
+    default=None,
+    help=(
+        "Append missing views to an existing run directory instead of starting a new one. "
+        "Requires exactly one PHRASE, matching the phrase/region recorded in that "
+        "directory's manifest.json."
+    ),
+)
 @click.pass_context
 def collect(
     ctx: click.Context,
@@ -84,6 +96,7 @@ def collect(
     cdp_url: str,
     timeout_seconds: float,
     keep_raw: bool,
+    resume_dir: Path | None,
 ) -> None:
     """Collect all MVP Wordstat reports for one or more PHRASE as Parquet datasets.
 
@@ -95,6 +108,20 @@ def collect(
     phrases = resolve_phrases(phrase, phrases_file)
     if not phrases:
         raise click.ClickException("At least one search phrase is required")
+    if resume_dir is not None:
+        if len(phrases) != 1:
+            raise click.ClickException("--resume-dir requires exactly one phrase")
+        # Pre-flight check: prepare_resume_directory is pure filesystem logic
+        # (see storage.py), so a bad --resume-dir (wrong phrase/region, no
+        # manifest.json, not a directory) can be rejected here before Chrome
+        # is even touched, instead of surfacing later as a batch failure.
+        # collect_many/​_collect_one still re-validate the same way right
+        # before use — this call is a fail-fast convenience, not the only
+        # guard against a mismatched directory.
+        try:
+            prepare_resume_directory(resume_dir, phrases[0], region)
+        except WordstatError as error:
+            raise click.ClickException(str(error)) from error
 
     collector = WordstatCollector(
         cdp_url=cdp_url,
@@ -103,7 +130,7 @@ def collect(
         keep_raw=keep_raw,
     )
     try:
-        batch = asyncio.run(collector.collect_many(phrases, region=region))
+        batch = asyncio.run(collector.collect_many(phrases, region=region, resume_directory=resume_dir))
     # Only domain errors become friendly messages; an unexpected ValueError
     # from a dependency should keep its traceback instead of being reworded.
     except WordstatError as error:
