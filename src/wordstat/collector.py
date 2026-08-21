@@ -254,7 +254,7 @@ class WordstatCollector:
 
         exports = []
         for view, selector in VIEW_SELECTORS.items():
-            await self._select_view(page, selector)
+            await self._select_view(page, selector, view)
             source = await self._download_current_view(page, session, downloads_path)
             try:
                 # Convert before disposing of the download, so a parse or
@@ -398,20 +398,34 @@ class WordstatCollector:
             " && button.offsetParent !== null && getComputedStyle(button).visibility !== 'hidden')",
         )
 
-    async def _select_view(self, page, selector: str) -> None:
-        # The download button and old table rows can remain in the DOM while
-        # Wordstat is switching views. The radio input is the actual active
-        # view marker (checked on the live page), and works for the map too,
-        # which has no table rows. Retry the click once if the marker does not
-        # become active before the normal wait timeout.
+    async def _select_view(self, page, selector: str, view: WordstatView) -> None:
+        # The download button can remain in the DOM while Wordstat is
+        # switching views. The radio input is the actual active view marker
+        # (checked on the live page). Retry the click once if the marker
+        # does not become active before the normal wait timeout.
+        #
+        # The radio flipping to checked does not mean the table has
+        # repainted yet: for the three table-based views, the download
+        # button and an active marker can both be true while the DOM still
+        # shows the *previous* view's rows (or none), so downloading right
+        # then silently produces a header-only CSV (row_count: 0 — see
+        # issue #3 and the known-issue note in CLAUDE.md). REGIONS (the
+        # map) has no table rows at all, so it is exempt from this extra
+        # gate — requiring row presence there would hang forever.
         target_selector = json.dumps(selector)
         ready_expression = f"""() => {{
             const label = document.querySelector({target_selector});
             const input = label?.querySelector('input')
                 ?? (label?.htmlFor ? document.getElementById(label.htmlFor) : null);
             return Boolean(input?.checked)
-                && Boolean(document.querySelector({json.dumps(DOWNLOAD_SELECTOR)}));
-        }}"""
+                && Boolean(document.querySelector({json.dumps(DOWNLOAD_SELECTOR)}))"""
+        if view != WordstatView.REGIONS:
+            ready_expression += (
+                f"\n                && document.querySelectorAll({json.dumps(TABLE_ROW_SELECTOR)}).length > 0;"
+            )
+        else:
+            ready_expression += ";"
+        ready_expression += "\n        }"
         for attempt in range(2):
             await self._click(page, selector)
             try:

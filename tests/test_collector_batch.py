@@ -374,7 +374,7 @@ def test_collect_one_rescues_the_csv_into_the_run_directory_on_write_failure(mon
     downloads_path = tmp_path / "downloads"
     downloads_path.mkdir()
 
-    async def fake_select_view(self, page, selector):
+    async def fake_select_view(self, page, selector, view):
         pass
 
     call_count = {"n": 0}
@@ -420,7 +420,7 @@ def test_collect_one_rescue_does_not_error_when_finalize_raw_already_moved_the_f
     downloads_path = tmp_path / "downloads"
     downloads_path.mkdir()
 
-    async def fake_select_view(self, page, selector):
+    async def fake_select_view(self, page, selector, view):
         pass
 
     async def fake_download(self, page, session, dl_path):
