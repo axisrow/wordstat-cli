@@ -533,13 +533,9 @@ class WordstatCollector:
     async def _set_period(self, page, granularity: Granularity, date_from: date, date_to: date | None) -> None:
         if date_to is None:
             raise InvalidRequestError("A period end date is required when a start date is provided")
-        # WEEKLY never reaches here: validate_period() (periods.py) rejects an
-        # explicit period for weekly granularity outright, because live CDP
-        # checks (issue #6 phase 2) showed Wordstat ignores the requested
-        # window for weekly and returns its own default range regardless of
-        # what was picked here. Only "month" and "day" popups are therefore
-        # real, reachable cases.
-        popup_type = "month" if granularity is Granularity.MONTHLY else "day"
+        popup_type = "month" if granularity is Granularity.MONTHLY else (
+            "week" if granularity is Granularity.WEEKLY else "day"
+        )
         await self._click(page, DATE_RANGE_SELECTOR)
         await self._select_calendar_date(page, popup_type, date_from)
         await self._click(page, DATE_RANGE_SELECTOR)
@@ -559,39 +555,39 @@ class WordstatCollector:
         await self._wait_for(page, expression)
 
     async def _select_calendar_date(self, page, popup_type: str, target: date) -> None:
-        # One function for every reachable granularity's date popup ("month"
-        # for monthly, "day" for daily). "week" is deliberately not a case
-        # here: WEEKLY never calls this (see _set_period) because Wordstat
-        # ignores an explicit weekly period entirely, so there is no live
-        # behavior to encode for a week-typed popup and no support for
-        # emulating one without contradicting that finding.
         root = f".range-datepicker_type_{popup_type}"
         await self._wait_for(
             page,
             f"() => [...document.querySelectorAll({json.dumps(root)})].some((x) => "
             "x.offsetParent !== null && getComputedStyle(x).visibility !== 'hidden')",
         )
-        # The live interface is Russian; map explicitly rather than depending
-        # on the host locale.
-        month_label = (
-            "январь февраль март апрель май июнь июль август сентябрь октябрь ноябрь декабрь".split()[
-                target.month - 1
-            ]
-        )
         if popup_type == "month":
             year_selector = f"{root} .datepicker-month__years_select > button"
             month_selector = f"{root} .react-datepicker__month-text"
+            # The live interface is Russian; map explicitly rather than
+            # depending on the host locale.
+            month_label = (
+                "январь февраль март апрель май июнь июль август сентябрь октябрь ноябрь декабрь".split()[
+                    target.month - 1
+                ]
+            )
         else:
             year_selector = f"{root} .range-datepicker__years_select > button"
             month_selector = f"{root} .range-datepicker__months_select > button"
+            month_label = (
+                "январь февраль март апрель май июнь июль август сентябрь октябрь ноябрь декабрь".split()[
+                    target.month - 1
+                ]
+            )
         await self._click(page, year_selector)
         await self._click_visible_text(page, ".Popup2_visible [role='option']", str(target.year))
+        if popup_type in {"day", "week"}:
+            await self._click(page, month_selector)
+            await self._click_visible_text(page, ".Popup2_visible [role='option']", month_label)
+        day_selector = f"{root} button[name='day']"
         if popup_type == "month":
             await self._click_visible_text(page, month_selector, month_label.capitalize())
         else:
-            await self._click(page, month_selector)
-            await self._click_visible_text(page, ".Popup2_visible [role='option']", month_label)
-            day_selector = f"{root} button[name='day']"
             await self._click_visible_date_button(page, day_selector, str(target.day))
 
     async def _click_visible_date_button(self, page, selector: str, text: str) -> None:
