@@ -261,3 +261,118 @@ def test_wait_for_period_applied_monthly_matches_nominative_cell_text(monkeypatc
     pattern = _extract_regex(captured["expression"])
     assert pattern.search("август 2024")
     assert not pattern.search("сентябрь 2024")
+
+
+def test_set_period_does_not_reopen_the_monthly_popup_between_dates(monkeypatch, tmp_path):
+    # Live CDP check (issue #6 phase 2, cycle-review round 2): the monthly
+    # calendar is a single range-picker, not two independent popups like
+    # day/week. Live DOM evidence: right after date_from is picked, every
+    # month element already carries the "in-selecting-range" class (the
+    # picker is already in range-selection mode), and the date-range
+    # button's text does not update to reflect date_from yet -- it only
+    # updates once date_to is picked in the SAME still-open popup. The
+    # intermediate DATE_RANGE_SELECTOR click that day/week rely on to
+    # reopen their popup instead closes this one (confirmed live:
+    # visibility flips to 'hidden'), so the follow-up _select_calendar_date
+    # call for date_to times out waiting for a popup that never reappears.
+    # Live-confirmed fix: for monthly, skip the intermediate click and let
+    # the second _select_calendar_date pick date_to in the still-open
+    # popup -- confirmed live to produce the correct button text
+    # "Январь 2024 — Июнь 2024".
+    calls = []
+
+    async def click(self, page, selector):
+        calls.append(("click", selector))
+
+    async def select_calendar_date(self, page, popup_type, target):
+        calls.append(("select_calendar_date", popup_type, target))
+
+    async def wait_for_period_applied(self, page, granularity, date_from):
+        calls.append(("wait_for_period_applied", granularity, date_from))
+
+    monkeypatch.setattr(WordstatCollector, "_click", click)
+    monkeypatch.setattr(WordstatCollector, "_select_calendar_date", select_calendar_date)
+    monkeypatch.setattr(WordstatCollector, "_wait_for_period_applied", wait_for_period_applied)
+
+    collector = WordstatCollector("cdp", tmp_path)
+    asyncio.run(
+        collector._set_period(object(), Granularity.MONTHLY, date(2024, 1, 1), date(2024, 6, 30))
+    )
+
+    click_count = sum(1 for call in calls if call[0] == "click")
+    assert click_count == 1, f"expected exactly one popup-open click for monthly, got {calls}"
+    select_calls = [call for call in calls if call[0] == "select_calendar_date"]
+    assert select_calls == [
+        ("select_calendar_date", "month", date(2024, 1, 1)),
+        ("select_calendar_date", "month", date(2024, 6, 30)),
+    ]
+
+
+def test_set_period_still_reopens_the_popup_between_dates_for_day_and_week(monkeypatch, tmp_path):
+    # day/week use independent popups per click (confirmed live in round 1:
+    # 255bca7's live weekly/daily runs both went through this two-click
+    # path successfully) -- only monthly's shared range-picker changes.
+    calls = []
+
+    async def click(self, page, selector):
+        calls.append("click")
+
+    async def select_calendar_date(self, page, popup_type, target):
+        pass
+
+    async def wait_for_period_applied(self, page, granularity, date_from):
+        pass
+
+    monkeypatch.setattr(WordstatCollector, "_click", click)
+    monkeypatch.setattr(WordstatCollector, "_select_calendar_date", select_calendar_date)
+    monkeypatch.setattr(WordstatCollector, "_wait_for_period_applied", wait_for_period_applied)
+
+    collector = WordstatCollector("cdp", tmp_path)
+    asyncio.run(
+        collector._set_period(object(), Granularity.DAILY, date(2026, 7, 1), date(2026, 8, 20))
+    )
+    assert len(calls) == 2
+
+    calls.clear()
+    asyncio.run(
+        collector._set_period(object(), Granularity.WEEKLY, date(2026, 7, 1), date(2026, 8, 20))
+    )
+    assert len(calls) == 2
+
+
+def test_select_calendar_date_clicks_the_month_popup_text_as_the_dom_renders_it(monkeypatch, tmp_path):
+    # Live CDP check (issue #6 phase 2, cycle-review round 2): the monthly
+    # calendar's month-text popup (.react-datepicker__month-text) renders
+    # lowercase nominative month names ("январь"), matching RUSSIAN_MONTHS
+    # verbatim -- confirmed by reading the popup's actual elements live.
+    # month_label.capitalize() ("Январь") never matches any of them, so
+    # every explicit --granularity monthly --date-from/--date-to request
+    # failed with InterfaceChangedError: "Wordstat option 'Январь' was not
+    # uniquely found" deep inside this click, despite validate_period
+    # accepting the request and the browser already being driven.
+    clicked_texts = []
+
+    async def click(self, page, selector):
+        pass
+
+    async def wait(self, page, expression, seconds=None, required=True):
+        pass
+
+    async def click_visible_text(self, page, selector, text):
+        clicked_texts.append((selector, text))
+
+    async def click_visible_date_button(self, page, selector, text):
+        clicked_texts.append((selector, text))
+
+    monkeypatch.setattr(WordstatCollector, "_click", click)
+    monkeypatch.setattr(WordstatCollector, "_wait_for", wait)
+    monkeypatch.setattr(WordstatCollector, "_click_visible_text", click_visible_text)
+    monkeypatch.setattr(WordstatCollector, "_click_visible_date_button", click_visible_date_button)
+
+    collector = WordstatCollector("cdp", tmp_path)
+    asyncio.run(collector._select_calendar_date(object(), "month", date(2024, 1, 1)))
+
+    month_click = next(
+        text for selector, text in clicked_texts if "month" in selector or "react-datepicker" in selector
+    )
+    assert month_click == "январь"

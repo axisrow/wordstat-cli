@@ -546,7 +546,34 @@ class WordstatCollector:
         date_from: date | None = None,
         date_to: date | None = None,
     ) -> None:
-        if granularity is Granularity.MONTHLY or len(dataset.rows) < 2:
+        # This parses dataset.rows[field] — the exported CSV's date column
+        # — with strptime("%d.%m.%Y"), NOT the DOM's displayed cell text.
+        # Live-measured weekly CSV (issue #6 phase 1 document — see
+        # `docs/ISSUE6_PHASE1_RESEARCH.md` on the PR #20 branch,
+        # `git show 4be8996:docs/ISSUE6_PHASE1_RESEARCH.md`): the exported
+        # field is named "Неделя с" and holds only the week's start date
+        # as a bare DD.MM.YYYY value ("22.06.2026") — no range, no week
+        # number — confirmed byte-for-byte from a real downloaded CSV. The
+        # DOM cell (_wait_for_table_granularity's WEEKLY pattern below)
+        # shows a genitive-month date *range* instead ("22 июня 2026 – 28
+        # июня 2026"); that is a different string in a different place and
+        # does not describe the exported column. Do not "fix" this parse
+        # to expect a range based on the DOM pattern — that would break a
+        # confirmed-working live path (cycle-review round 1's R2 and round
+        # 2's RR1 both raised this same claim from reading the code
+        # without this doc open; both were false positives).
+        #
+        # Monthly's period field is a nominative Russian month name
+        # ("август 2024", confirmed live — issue #6 phase 1 document), not
+        # a strptime("%d.%m.%Y")-parseable date the way daily/weekly are,
+        # so neither contiguity nor containment can be validated here for
+        # it; _wait_for_period_applied still gates monthly's start
+        # boundary before download (same mechanism as daily/weekly), and
+        # _actual_period records the raw field/from/to strings into the
+        # manifest for every dynamics export including monthly, so actual
+        # coverage stays observable post-hoc even without this check
+        # (cycle-review round 2, C2 triage).
+        if granularity is Granularity.MONTHLY or not dataset.rows:
             return
         field = dataset.headers[0]
         try:
@@ -555,13 +582,14 @@ class WordstatCollector:
             raise InterfaceChangedError(
                 f"Wordstat returned an unexpected {granularity.value} dynamics date format"
             ) from error
-        step = timedelta(days=1 if granularity is Granularity.DAILY else 7)
-        for previous, current in zip(dates, dates[1:]):
-            if current - previous != step:
-                raise InterfaceChangedError(
-                    f"Wordstat returned a gap in the {granularity.value} dynamics series "
-                    f"between {previous:%d.%m.%Y} and {current:%d.%m.%Y}"
-                )
+        if len(dates) >= 2:
+            step = timedelta(days=1 if granularity is Granularity.DAILY else 7)
+            for previous, current in zip(dates, dates[1:]):
+                if current - previous != step:
+                    raise InterfaceChangedError(
+                        f"Wordstat returned a gap in the {granularity.value} dynamics series "
+                        f"between {previous:%d.%m.%Y} and {current:%d.%m.%Y}"
+                    )
         # Containment, not equality: a shorter export fully inside the
         # requested window is legitimate (the daily series' variable
         # trailing tail, confirmed live — issue #6 phase 1 document), so
@@ -573,7 +601,14 @@ class WordstatCollector:
         # downloading; it has no equivalent check for date_to, so a table
         # that has not yet repainted past a previous, stale window can
         # download and be recorded as complete with data that never
-        # entered the requested window at all. Only applies when an
+        # entered the requested window at all. Deliberately runs even for
+        # a single-row export (needs only dates[0]/dates[-1], which are
+        # the same row — unlike the pairwise contiguity loop above, which
+        # needs at least two rows): a single stale/truncated row is not
+        # exempt just because it is too short to check contiguity
+        # (cycle-review round 2, C2 triage — the original version gated
+        # this behind the same `len(rows) < 2` early return as contiguity
+        # and let a 1-row export bypass it entirely). Only applies when an
         # explicit period was requested (date_from/date_to are None for
         # the UI's default window, which this function cannot validate
         # against any specific boundary).
@@ -629,7 +664,28 @@ class WordstatCollector:
         )
         await self._click(page, DATE_RANGE_SELECTOR)
         await self._select_calendar_date(page, popup_type, date_from)
-        await self._click(page, DATE_RANGE_SELECTOR)
+        if popup_type != "month":
+            # day/week: independent popups per click, live-confirmed by
+            # 255bca7's daily/weekly runs going through this exact
+            # two-click path successfully.
+            await self._click(page, DATE_RANGE_SELECTOR)
+        else:
+            # month: a single shared range-picker, not two independent
+            # popups (live CDP check, issue #6 phase 2, cycle-review
+            # round 2). Right after date_from is picked, every month
+            # element already carries the "in-selecting-range" class —
+            # the picker is already in range-selection mode — and the
+            # date-range button's text does not update to reflect
+            # date_from yet; it only updates once date_to is picked in
+            # the SAME still-open popup. A second DATE_RANGE_SELECTOR
+            # click here closes this popup instead of reopening it
+            # (confirmed live: visibility flips to 'hidden'), so the
+            # follow-up _select_calendar_date for date_to would time out
+            # waiting for a popup that never reappears. Confirmed live
+            # that skipping the intermediate click and picking date_to
+            # directly in the still-open popup produces the correct
+            # button text "Январь 2024 — Июнь 2024".
+            pass
         await self._select_calendar_date(page, popup_type, date_to)
         # _wait_for_table_granularity alone is not enough here: it only
         # checks that the first cell's *format* matches the granularity
@@ -718,7 +774,18 @@ class WordstatCollector:
             await self._click_visible_text(page, ".Popup2_visible [role='option']", month_label)
         day_selector = f"{root} button[name='day']"
         if popup_type == "month":
-            await self._click_visible_text(page, month_selector, month_label.capitalize())
+            # Live CDP check (issue #6 phase 2, cycle-review round 2): the
+            # month-text popup renders lowercase nominative month names
+            # ("январь"), matching RUSSIAN_MONTHS verbatim.
+            # month_label.capitalize() ("Январь") never matches any of
+            # them — every explicit monthly request with
+            # --date-from/--date-to failed here with InterfaceChangedError
+            # ("Wordstat option 'Январь' was not uniquely found") despite
+            # validate_period accepting the request and the browser
+            # already being driven. Do not re-add .capitalize(): it was
+            # never confirmed live and is contradicted by the confirmed
+            # live DOM text.
+            await self._click_visible_text(page, month_selector, month_label)
         else:
             await self._click_visible_date_button(page, day_selector, str(target.day))
 
