@@ -14,10 +14,16 @@ from wordstat.storage import prepare_resume_directory
 _CONFIG = load_config()
 _DEFAULT_CDP_URL = _CONFIG.get("cdp_url", "http://127.0.0.1:9222")
 # Wordstat exports CSV as UTF-8 with BOM; a phrases file typed or saved
-# on the same machine can plausibly be in either. Mirrors the encoding probe
-# in csv_io.py, minus utf-8-sig (a phrases file is authored by hand, not
-# exported by Wordstat, so a BOM is unlikely but harmless either way).
-_PHRASES_FILE_ENCODINGS = ("utf-8", "cp1251")
+# on the same machine can plausibly be in either, and utf-8-sig must come
+# before plain utf-8: a BOM'd file decodes successfully under plain
+# "utf-8" too, but leaves "﻿" attached to the first line. Neither
+# resolve_phrases' line.strip() nor the collector's own phrase.strip()
+# removes it ('﻿'.isspace() is False), so a BOM left in is not
+# harmless — it silently prepends an invisible character to the first
+# phrase, which then propagates into the typed Wordstat search, the
+# run-directory slug, and manifest.json. Mirrors the encoding probe in
+# csv_io.py.
+_PHRASES_FILE_ENCODINGS = ("utf-8-sig", "cp1251")
 
 
 @click.group()
