@@ -74,6 +74,13 @@ def _read_phrases_file(path: Path) -> str:
     default=False,
     help="Keep each downloaded CSV as <view>.csv instead of discarding it after conversion.",
 )
+@click.option(
+    "--resume",
+    "resume_directory",
+    type=click.Path(path_type=Path, file_okay=False, exists=True),
+    default=None,
+    help="Explicit existing run directory to complete; its phrase and region must match.",
+)
 @click.pass_context
 def collect(
     ctx: click.Context,
@@ -84,6 +91,7 @@ def collect(
     cdp_url: str,
     timeout_seconds: float,
     keep_raw: bool,
+    resume_directory: Path | None,
 ) -> None:
     """Collect all MVP Wordstat reports for one or more PHRASE as Parquet datasets.
 
@@ -103,7 +111,10 @@ def collect(
         keep_raw=keep_raw,
     )
     try:
-        batch = asyncio.run(collector.collect_many(phrases, region=region))
+        if resume_directory is None:
+            batch = asyncio.run(collector.collect_many(phrases, region=region))
+        else:
+            batch = asyncio.run(collector.collect_many(phrases, region=region, resume_directory=resume_directory))
     # Only domain errors become friendly messages; an unexpected ValueError
     # from a dependency should keep its traceback instead of being reworded.
     except WordstatError as error:

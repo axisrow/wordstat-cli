@@ -1,9 +1,13 @@
 """Run-directory and manifest handling."""
 
+import json
+import os
 import re
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
+from wordstat.errors import InvalidRequestError
 from wordstat.models import CollectionManifest, WordstatView
 
 
@@ -45,8 +49,46 @@ def finalize_raw(source: Path, run_directory: Path, view: WordstatView, keep_raw
 
 
 def write_manifest(path: Path, manifest: CollectionManifest) -> None:
-    """Write reproducibility metadata in stable UTF-8 JSON."""
+    """Atomically write reproducibility metadata in stable UTF-8 JSON."""
 
     # pydantic emits UTF-8 without escaping non-ASCII, so the Cyrillic stays
     # readable without a round-trip through the json module.
-    path.write_text(manifest.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            handle.write(manifest.model_dump_json(indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def read_manifest(path: Path) -> CollectionManifest:
+    """Load a run manifest, preserving a useful domain error for bad input."""
+
+    try:
+        return CollectionManifest.model_validate(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError) as error:
+        raise InvalidRequestError(f"Cannot read manifest {path}: {error}") from error
+
+
+def validate_resume_directory(run_directory: Path, phrase: str, region: str) -> CollectionManifest:
+    """Ensure an explicitly selected run belongs to this exact request."""
+
+    manifest_path = run_directory / "manifest.json"
+    if not run_directory.is_dir() or not manifest_path.is_file():
+        raise InvalidRequestError(f"Resume directory has no manifest: {run_directory}")
+    manifest = read_manifest(manifest_path)
+    if manifest.phrase != phrase or manifest.region != region:
+        raise InvalidRequestError(
+            f"Resume manifest request mismatch: expected phrase={phrase!r}, region={region!r}; "
+            f"found phrase={manifest.phrase!r}, region={manifest.region!r}"
+        )
+    return manifest

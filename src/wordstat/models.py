@@ -16,6 +16,13 @@ class WordstatView(StrEnum):
     REGIONS = "regions"
 
 
+class CollectionStatus(StrEnum):
+    """Whether all four reports have been written to a run directory."""
+
+    COMPLETE = "complete"
+    INCOMPLETE = "incomplete"
+
+
 class CsvDataset(BaseModel):
     """A parsed CSV export with headers preserved exactly as Wordstat provided them.
 
@@ -53,6 +60,8 @@ class CollectionManifest(BaseModel):
     created_at: datetime
     source_url: str
     exports: list[ExportSummary]
+    status: CollectionStatus = CollectionStatus.COMPLETE
+    missing_views: list[WordstatView] = Field(default_factory=list)
 
 
 class CollectionResult(BaseModel):

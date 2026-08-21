@@ -1,8 +1,18 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
-from wordstat.models import CollectionManifest, ExportSummary, WordstatView
-from wordstat.storage import create_run_directory, finalize_raw, slugify, write_manifest
+import pytest
+
+from wordstat.errors import InvalidRequestError
+from wordstat.models import CollectionManifest, CollectionStatus, ExportSummary, WordstatView
+from wordstat.storage import (
+    create_run_directory,
+    finalize_raw,
+    read_manifest,
+    slugify,
+    validate_resume_directory,
+    write_manifest,
+)
 
 
 def test_create_run_directory_is_unique_and_keeps_cyrillic(tmp_path: Path) -> None:
@@ -40,6 +50,56 @@ def test_write_manifest_preserves_cyrillic_metadata(tmp_path: Path) -> None:
     write_manifest(path, manifest)
 
     assert '"phrase": "ремонт квартир"' in path.read_text(encoding="utf-8")
+
+
+def test_write_manifest_does_not_corrupt_existing_file_if_replace_fails(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "manifest.json"
+    path.write_text("old manifest", encoding="utf-8")
+    manifest = CollectionManifest(
+        phrase="новый", region="Россия", created_at=datetime.now(UTC), source_url="url", exports=[]
+    )
+
+    def fail_replace(source, destination):
+        raise OSError("simulated interruption")
+
+    monkeypatch.setattr("wordstat.storage.os.replace", fail_replace)
+    with pytest.raises(OSError, match="simulated interruption"):
+        write_manifest(path, manifest)
+    assert path.read_text(encoding="utf-8") == "old manifest"
+
+
+def test_manifest_distinguishes_incomplete_run_from_complete(tmp_path: Path) -> None:
+    path = tmp_path / "manifest.json"
+    partial = CollectionManifest(
+        phrase="чай", region="Россия", created_at=datetime.now(UTC), source_url="url", exports=[],
+        status=CollectionStatus.INCOMPLETE, missing_views=list(WordstatView),
+    )
+    write_manifest(path, partial)
+    loaded = read_manifest(path)
+    assert loaded.status is CollectionStatus.INCOMPLETE
+    assert loaded.missing_views == list(WordstatView)
+
+    complete = partial.model_copy(update={"status": CollectionStatus.COMPLETE, "missing_views": []})
+    write_manifest(path, complete)
+    loaded = read_manifest(path)
+    assert loaded.status is CollectionStatus.COMPLETE
+    assert loaded.missing_views == []
+
+
+def test_resume_validation_accepts_same_request_and_rejects_other_request(tmp_path: Path) -> None:
+    run = tmp_path / "run"
+    run.mkdir()
+    manifest = CollectionManifest(
+        phrase="чай", region="Москва", created_at=datetime.now(UTC), source_url="url", exports=[],
+        status=CollectionStatus.INCOMPLETE, missing_views=list(WordstatView),
+    )
+    write_manifest(run / "manifest.json", manifest)
+
+    assert validate_resume_directory(run, "чай", "Москва").phrase == "чай"
+    with pytest.raises(InvalidRequestError, match="mismatch"):
+        validate_resume_directory(run, "кофе", "Москва")
+    with pytest.raises(InvalidRequestError, match="mismatch"):
+        validate_resume_directory(run, "чай", "Россия")
 
 
 def test_finalize_raw_removes_the_download_by_default(tmp_path: Path) -> None:
