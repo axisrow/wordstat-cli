@@ -147,13 +147,32 @@ class WordstatCollector:
         # Both are real, unconditional pauses against the live UI (see their
         # call sites in _collect_one) — not upper-bound timeouts like
         # timeout_seconds, which _wait_for polls against a condition and
-        # returns from early. Nothing in the live DOM signals "the export
-        # blob has been rebuilt" or "the empty table has repainted", so
-        # there is no condition for _wait_for to poll here; a fixed sleep is
-        # the only available fix. Kept as constructor parameters (not
-        # hardcoded) so tests against a fake, instantly-responding page can
-        # set them to 0 instead of actually blocking the test process for
-        # real wall-clock time on every view of every phrase.
+        # returns early. Kept as constructor parameters (not hardcoded) so
+        # tests against a fake, instantly-responding page can set them to 0
+        # instead of actually blocking the test process for real wall-clock
+        # time on every view of every phrase (140 tests went from 26.9s to
+        # 0.77s once collect_many's own tests did this — see git history).
+        #
+        # settling_seconds (introduced in efaa9ba, issue #6 phase 2): a
+        # preventive pause before downloading each non-map view, guarding
+        # against a header-only CSV race first observed for issue #11
+        # (Wordstat can return a checked radio + enabled download button
+        # before the export blob has actually been rebuilt for the newly
+        # selected phrase/view). No one has reproduced *this specific*
+        # settling race with reliable repro steps — the 1.0s value was
+        # chosen without a live timing measurement, not derived from one.
+        # Cost: +1s per non-map view, +3s per phrase (3 of 4 views are
+        # non-map), so +50s across a 50-phrase batch. Do not remove without
+        # a way to verify nothing regresses — issue #22 currently blocks a
+        # full CLI run from reaching DYNAMICS at all (see collector.py's
+        # fail-closed behavior on empty top exports), so there is no cheap
+        # end-to-end signal today that would catch a regression from
+        # removing this.
+        #
+        # empty_export_retry_seconds: unlike the above, this one does have
+        # a concrete, structural trigger — it only fires after
+        # _is_untrustworthy_empty_export has already caught a table-visible-
+        # but-CSV-empty export on this specific run, not preventively.
         self.settling_seconds = settling_seconds
         self.empty_export_retry_seconds = empty_export_retry_seconds
         self._previous_table_snapshot: str | None = None
