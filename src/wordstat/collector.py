@@ -5,7 +5,7 @@ import json
 import tempfile
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from browser_use.browser import BrowserSession
@@ -28,6 +28,7 @@ from wordstat.models import (
     PhraseFailure,
     WordstatView,
 )
+from wordstat.periods import Granularity, validate_period
 from wordstat.storage import (
     create_run_directory,
     finalize_raw,
@@ -42,6 +43,8 @@ QUERY_SELECTOR = 'input[placeholder="Введите слово или слово
 SEARCH_SELECTOR = ".wordstat__search-button"
 DOWNLOAD_SELECTOR = "button.save-button"
 DOWNLOAD_CSV_MENU_ITEM_SELECTOR = "a[download]:has(button.save-csv-button)"
+GRANULARITY_SELECTOR = ".wordstat__content-type_select > button"
+DATE_RANGE_SELECTOR = ".range-datepicker__selected-dates > button"
 REGION_BUTTON_SELECTOR = ".settings__selected button"
 TABLE_ROW_SELECTOR = ".table__wrapper tbody tr"
 # Tab selectors live here with the rest of the DOM knowledge; the markup is
@@ -148,6 +151,9 @@ class WordstatCollector:
         phrases: list[str],
         region: str = "Россия",
         resume_directory: Path | None = None,
+        granularity: Granularity = Granularity.MONTHLY,
+        date_from: date | None = None,
+        date_to: date | None = None,
     ) -> BatchCollectionResult:
         """Collect reports for several phrases inside a single browser session.
 
@@ -165,6 +171,7 @@ class WordstatCollector:
         """
 
         region = region.strip()
+        validate_period(granularity, date_from, date_to)
         if not phrases:
             raise InvalidRequestError("At least one search phrase is required")
         if not region:
@@ -233,15 +240,22 @@ class WordstatCollector:
                         # _collect_one for why the region control can't be
                         # re-selected once a phrase's view loop has run (and
                         # doesn't need to be after that).
+                        collect_kwargs = {
+                            "set_region": not region_ready,
+                            "on_region_applied": _mark_region_ready,
+                            "resume_directory": resume_directory,
+                        }
+                        # Keep the historical call shape for the default
+                        # monthly path; several integrations monkeypatch this
+                        # seam and default behavior must remain unchanged.
+                        if granularity is not Granularity.MONTHLY or date_from is not None:
+                            collect_kwargs.update(
+                                granularity=granularity,
+                                date_from=date_from,
+                                date_to=date_to,
+                            )
                         result = await self._collect_one(
-                            page,
-                            session,
-                            downloads_path,
-                            phrase,
-                            region,
-                            set_region=not region_ready,
-                            on_region_applied=_mark_region_ready,
-                            resume_directory=resume_directory,
+                            page, session, downloads_path, phrase, region, **collect_kwargs
                         )
                         results.append(result)
                     except AuthenticationRequiredError as error:
@@ -279,6 +293,9 @@ class WordstatCollector:
         set_region: bool = True,
         on_region_applied: Callable[[], None] | None = None,
         resume_directory: Path | None = None,
+        granularity: Granularity = Granularity.MONTHLY,
+        date_from: date | None = None,
+        date_to: date | None = None,
     ) -> CollectionResult:
         # Checked once before the batch starts (collect_many), but a session
         # can lose authentication mid-batch (e.g. Yandex logs it out); check
@@ -295,6 +312,11 @@ class WordstatCollector:
             # separate, explicit path, not a fallback baked into it.
             run_directory = resume_directory
             manifest = prepare_resume_directory(run_directory, phrase, region)
+            requested_period = self._requested_period(date_from, date_to)
+            if manifest.granularity is not granularity or manifest.requested_period != requested_period:
+                raise InvalidRequestError(
+                    "--resume-dir was created with a different dynamics granularity or requested period"
+                )
             manifest_path = run_directory / "manifest.json"
             pending_views = views_to_collect(run_directory, manifest)
             if not pending_views:
@@ -359,6 +381,8 @@ class WordstatCollector:
                 updated_at=start,
                 source_url=await page.get_url(),
                 exports=[],
+                granularity=granularity,
+                requested_period=self._requested_period(date_from, date_to),
             )
             write_manifest(manifest_path, manifest)
         else:
@@ -378,17 +402,39 @@ class WordstatCollector:
         for view in pending_views:
             selector = VIEW_SELECTORS[view]
             await self._select_view(page, selector, view)
+            # The live UI can expose the first table row before the export
+            # blob has been rebuilt for the selected phrase/view. A short
+            # settling interval prevents a header-only CSV from racing the
+            # table repaint; the structural row gate above remains required.
+            if view is not WordstatView.REGIONS:
+                await asyncio.sleep(1.0)
+            if view is WordstatView.DYNAMICS and (
+                granularity is not Granularity.MONTHLY or date_from is not None
+            ):
+                await self._set_granularity(page, granularity)
+                if date_from is not None:
+                    await self._set_period(page, granularity, date_from, date_to)
             source = await self._download_current_view(page, session, downloads_path)
             try:
                 # Convert before disposing of the download, so a parse or
-                # write failure leaves the raw CSV on disk to inspect.
+                # write failure leaves the raw CSV on disk to inspect. The
+                # live export blob can lag the table repaint once; retry an
+                # empty table export once before failing closed.
                 dataset = parse_wordstat_csv(source, view)
                 if _is_untrustworthy_empty_export(view, dataset):
+                    await asyncio.sleep(2.0)
+                    source = await self._download_current_view(page, session, downloads_path)
+                    dataset = parse_wordstat_csv(source, view)
+                if _is_untrustworthy_empty_export(view, dataset):
                     raise InterfaceChangedError(
-                        f"Wordstat returned an empty {view.value} CSV, but the page had rendered at "
-                        "least one table row before the download was triggered; export is not trustworthy"
+                        f"Wordstat returned an empty {view.value} CSV after a retry, but the page had rendered "
+                        "at least one table row before the download was triggered; export is not trustworthy"
                     )
-                data_path, dtypes = write_dataset(dataset, run_directory)
+                file_name = self._dynamics_file_name(granularity) if view is WordstatView.DYNAMICS else None
+                if file_name is None:
+                    data_path, dtypes = write_dataset(dataset, run_directory)
+                else:
+                    data_path, dtypes = write_dataset(dataset, run_directory, file_name=file_name)
                 raw_path = finalize_raw(source, run_directory, view, self.keep_raw)
             except Exception:  # noqa: BLE001
                 # source lives in the batch's shared, temporary downloads
@@ -416,6 +462,10 @@ class WordstatCollector:
             # CollectionManifest.status), not a stale one still claiming
             # every view is missing.
             manifest = merge_export(manifest, export)
+            if view is WordstatView.DYNAMICS:
+                manifest = manifest.model_copy(
+                    update={"actual_period": self._actual_period(dataset)}
+                )
             write_manifest(manifest_path, manifest)
 
         return CollectionResult(
@@ -423,6 +473,127 @@ class WordstatCollector:
             manifest_path=manifest_path,
             manifest=manifest,
         )
+
+    @staticmethod
+    def _requested_period(date_from: date | None, date_to: date | None) -> dict[str, str] | None:
+        if date_from is None or date_to is None:
+            return None
+        return {"from": date_from.isoformat(), "to": date_to.isoformat()}
+
+    @staticmethod
+    def _actual_period(dataset: CsvDataset) -> dict[str, str] | None:
+        if not dataset.rows or not dataset.headers:
+            return None
+        field = dataset.headers[0]
+        return {"field": field, "from": dataset.rows[0][field], "to": dataset.rows[-1][field]}
+
+
+    @staticmethod
+    def _dynamics_file_name(granularity: Granularity) -> str:
+        # Preserve the old monthly filename for existing consumers; non-monthly
+        # exports must carry their granularity in the filename.
+        return "dynamics.parquet" if granularity is Granularity.MONTHLY else f"dynamics_{granularity.value}.parquet"
+
+    async def _set_granularity(self, page, granularity: Granularity) -> None:
+        labels = {
+            Granularity.DAILY: "По дням",
+            Granularity.WEEKLY: "По неделям",
+            Granularity.MONTHLY: "По месяцам",
+        }
+        await self._click(page, GRANULARITY_SELECTOR)
+        await self._click_visible_text(page, ".Popup2_visible [role='option']", labels[granularity])
+        await self._wait_for(
+            page,
+            f"() => document.querySelector({json.dumps(GRANULARITY_SELECTOR)})?.textContent?.trim() === "
+            f"{json.dumps(labels[granularity])}",
+        )
+
+    async def _set_period(self, page, granularity: Granularity, date_from: date, date_to: date | None) -> None:
+        if date_to is None:
+            raise InvalidRequestError("A period end date is required when a start date is provided")
+        popup_type = "month" if granularity is Granularity.MONTHLY else "day"
+        await self._click(page, DATE_RANGE_SELECTOR)
+        await self._select_calendar_date(page, popup_type, date_from)
+        await self._click(page, DATE_RANGE_SELECTOR)
+        await self._select_calendar_date(page, popup_type, date_to)
+
+    async def _select_calendar_date(self, page, popup_type: str, target: date) -> None:
+        root = f".range-datepicker_type_{popup_type}"
+        await self._wait_for(
+            page,
+            f"() => [...document.querySelectorAll({json.dumps(root)})].some((x) => "
+            "x.offsetParent !== null && getComputedStyle(x).visibility !== 'hidden')",
+        )
+        if popup_type == "month":
+            year_selector = f"{root} .datepicker-month__years_select > button"
+            month_selector = f"{root} .react-datepicker__month-text"
+            # The live interface is Russian; map explicitly rather than
+            # depending on the host locale.
+            month_label = (
+                "январь февраль март апрель май июнь июль август сентябрь октябрь ноябрь декабрь".split()[
+                    target.month - 1
+                ]
+            )
+        else:
+            year_selector = f"{root} .range-datepicker__years_select > button"
+            month_selector = f"{root} .range-datepicker__months_select > button"
+            month_label = (
+                "январь февраль март апрель май июнь июль август сентябрь октябрь ноябрь декабрь".split()[
+                    target.month - 1
+                ]
+            )
+        await self._click(page, year_selector)
+        await self._click_visible_text(page, ".Popup2_visible [role='option']", str(target.year))
+        if popup_type == "day":
+            await self._click(page, month_selector)
+            await self._click_visible_text(page, ".Popup2_visible [role='option']", month_label)
+        day_selector = f"{root} button[name='day']"
+        if popup_type == "month":
+            await self._click_visible_text(page, month_selector, month_label.capitalize())
+        else:
+            await self._click_visible_date_button(page, day_selector, str(target.day))
+
+    async def _click_visible_date_button(self, page, selector: str, text: str) -> None:
+        result = await page.evaluate(
+            """(...args) => {
+                const [selector, text] = args;
+                const matches = [...document.querySelectorAll(selector)].filter((element) => {
+                    const style = getComputedStyle(element);
+                    return element.textContent?.trim() === text
+                        && !element.className.toString().includes('outside')
+                        && !element.className.toString().includes('disabled')
+                        && element.offsetParent !== null
+                        && style.visibility !== 'hidden';
+                });
+                if (matches.length !== 1) return JSON.stringify({count: matches.length});
+                matches[0].click();
+                return JSON.stringify({count: 1});
+            }""",
+            selector,
+            text,
+        )
+        if json.loads(result) != {"count": 1}:
+            raise InterfaceChangedError(f"Wordstat date control {selector!r} was not uniquely found")
+
+    async def _click_visible_text(self, page, selector: str, text: str) -> None:
+        result = await page.evaluate(
+            """(...args) => {
+                const [selector, text] = args;
+                const matches = [...document.querySelectorAll(selector)].filter((element) => {
+                    const style = getComputedStyle(element);
+                    return element.textContent?.trim() === text
+                        && element.offsetParent !== null
+                        && style.visibility !== 'hidden';
+                });
+                if (matches.length !== 1) return JSON.stringify({count: matches.length});
+                matches[0].click();
+                return JSON.stringify({count: 1});
+            }""",
+            selector,
+            text,
+        )
+        if json.loads(result) != {"count": 1}:
+            raise InterfaceChangedError(f"Wordstat option {text!r} was not uniquely found")
 
     async def _assert_authenticated(self, page) -> None:
         state = await page.evaluate(

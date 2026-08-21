@@ -1,7 +1,8 @@
 """Column type inference for Wordstat's localized string values.
 
 Wordstat exports every value as text: counts arrive as ``"5 228 679"`` with
-non-breaking thousands separators, and dynamics periods as ``"01.2024"``.
+non-breaking thousands separators, and dynamics periods as ``"август 2024"``
+or dates such as ``"22.06.2026"``.
 Writing those straight to Parquet would only change the container, so columns
 are typed here first.
 
@@ -24,8 +25,8 @@ from types import NotImplementedType
 _WHITESPACE = re.compile(r"\s")
 
 # Deliberately strict.  ``int()``/``float()`` would accept values that are not
-# numbers in this data: "01.2024" (a dynamics period) parses as 1.2024,
-# silently destroying it, and "1e5", "1_000", "inf" and "nan" are accepted too.
+# numbers in this data and could silently destroy a dotted date. Real monthly
+# periods are "август 2024"; daily/weekly exports use "22.06.2026".
 # Only a comma is a decimal separator here — Wordstat exports with a Russian
 # locale — which is precisely what rejects the dotted period format.
 _NUMERIC = re.compile(r"^-?[0-9]+(?:,[0-9]+)?$")

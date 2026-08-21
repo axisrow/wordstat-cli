@@ -11,8 +11,10 @@ from wordstat.dtypes import infer_column
 from wordstat.models import CsvDataset
 
 
-def write_dataset(dataset: CsvDataset, run_directory: Path) -> tuple[Path, dict[str, str]]:
-    """Write one report as ``<view>.parquet`` and report the inferred column types.
+def write_dataset(
+    dataset: CsvDataset, run_directory: Path, file_name: str | None = None
+) -> tuple[Path, dict[str, str]]:
+    """Write one report and report the inferred column types.
 
     Column order follows the export's own header order.  The returned dtype
     mapping goes into the manifest so an unexpected export format is visible
@@ -33,6 +35,6 @@ def write_dataset(dataset: CsvDataset, run_directory: Path) -> tuple[Path, dict[
             columns[header] = pa.array(coerced, type=pa.type_for_alias(dtype))
 
     table = pa.table(columns)
-    destination = run_directory / f"{dataset.view.value}.parquet"
+    destination = run_directory / (file_name or f"{dataset.view.value}.parquet")
     pq.write_table(table, destination, compression="zstd")
     return destination, dtypes

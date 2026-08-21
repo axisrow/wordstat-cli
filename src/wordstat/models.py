@@ -6,6 +6,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
+from wordstat.periods import Granularity
+
 
 class WordstatView(StrEnum):
     """The four Wordstat reports exported by the MVP."""
@@ -103,6 +105,9 @@ class CollectionManifest(BaseModel):
     updated_at: datetime | None = None
     source_url: str
     exports: list[ExportSummary]
+    granularity: Granularity = Granularity.MONTHLY
+    requested_period: dict[str, str] | None = None
+    actual_period: dict[str, str] | None = None
 
     @computed_field  # type: ignore[prop-decorator]
     @property

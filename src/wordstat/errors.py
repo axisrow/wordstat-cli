@@ -9,6 +9,10 @@ class InvalidRequestError(WordstatError):
     """The requested phrase or region is unusable before the browser is touched."""
 
 
+class InvalidPeriodError(InvalidRequestError):
+    """The requested dynamics granularity/window is not supported."""
+
+
 class AuthenticationRequiredError(WordstatError):
     """Wordstat is reachable but the attached browser is not authenticated."""
 

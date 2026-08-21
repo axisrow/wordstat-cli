@@ -51,13 +51,33 @@ def test_write_dataset_writes_empty_cells_as_null(tmp_path):
 def test_write_dataset_keeps_dynamics_periods_as_text(tmp_path):
     dataset = _dataset(
         ["Период", "Показов"],
-        [{"Период": "01.2024", "Показов": "10"}, {"Период": "02.2024", "Показов": "20"}],
+        [{"Период": "август 2024", "Показов": "10"}, {"Период": "сентябрь 2024", "Показов": "20"}],
         view=WordstatView.DYNAMICS,
     )
 
     _, dtypes = write_dataset(dataset, tmp_path)
 
     assert dtypes["Период"] == "string"
+
+
+def test_write_dataset_keeps_daily_dates_as_text(tmp_path):
+    dataset = _dataset(
+        ["Дата", "Показов"],
+        [{"Дата": "22.06.2026", "Показов": "10"}, {"Дата": "23.06.2026", "Показов": "20"}],
+        view=WordstatView.DYNAMICS,
+    )
+
+    _, dtypes = write_dataset(dataset, tmp_path)
+
+    assert dtypes["Дата"] == "string"
+
+
+def test_write_dataset_accepts_granularity_specific_filename(tmp_path):
+    dataset = _dataset(["Дата", "Показов"], [{"Дата": "22.06.2026", "Показов": "10"}], view=WordstatView.DYNAMICS)
+
+    path, _ = write_dataset(dataset, tmp_path, file_name="dynamics_daily.parquet")
+
+    assert path.name == "dynamics_daily.parquet"
 
 
 def test_write_dataset_handles_a_report_without_rows(tmp_path):
