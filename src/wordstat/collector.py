@@ -548,7 +548,7 @@ class WordstatCollector:
         }
         expression = (
             "() => new RegExp(" + json.dumps(patterns[granularity]) + ").test(" 
-            f"document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.textContent?.trim() ?? '')"
+            f"document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.querySelector('td')?.textContent?.trim() ?? '')"
         )
         await self._wait_for(page, expression)
 
