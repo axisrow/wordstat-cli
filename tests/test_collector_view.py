@@ -155,25 +155,37 @@ def _dataset(view: WordstatView, rows: list[dict[str, str]]) -> CsvDataset:
     return CsvDataset(view=view, headers=["query", "count"], rows=rows)
 
 
-@pytest.mark.parametrize(
-    "view", [WordstatView.TOP_POPULAR, WordstatView.TOP_RELATED, WordstatView.DYNAMICS]
-)
-def test_empty_export_is_untrustworthy_for_table_views_regardless_of_dom_state(view):
-    # Regression guard for issue #11 (and its cycle-2 follow-up): _select_view
-    # already hard-gates TABLE_ROW_SELECTOR.length > 0 on the DOM before
-    # "Скачать" is ever clicked for every view but REGIONS, so an empty CSV
-    # reaching this point is already a contradiction for all three of these
-    # table-based views — it must be rejected unconditionally, with no
-    # second, later DOM read able to wave it through as "legitimately empty"
-    # (that re-read can observe a table that has since emptied and silently
-    # accept a corrupted export — the exact bug this predicate replaces).
-    assert _is_untrustworthy_empty_export(view, _dataset(view, [])) is True
+def test_empty_dynamics_export_is_untrustworthy():
+    # Regression guard for issue #11 (and its cycle-2 follow-up): live CDP
+    # measurements found DYNAMICS reliably non-empty (24 rows across three
+    # separate runs, corroborated by PR #20), so an empty DYNAMICS export
+    # reaching this point is anomalous and must be rejected, with no second,
+    # later DOM read able to wave it through as "legitimately empty" (that
+    # re-read can observe a table that has since emptied and silently accept
+    # a corrupted export — the exact bug this predicate replaces).
+    assert _is_untrustworthy_empty_export(WordstatView.DYNAMICS, _dataset(WordstatView.DYNAMICS, [])) is True
 
 
-@pytest.mark.parametrize(
-    "view", [WordstatView.TOP_POPULAR, WordstatView.TOP_RELATED, WordstatView.DYNAMICS]
-)
-def test_non_empty_export_is_trusted_for_table_views(view):
+def test_non_empty_dynamics_export_is_trusted():
+    dataset = _dataset(WordstatView.DYNAMICS, [{"query": "a", "count": "1"}])
+    assert _is_untrustworthy_empty_export(WordstatView.DYNAMICS, dataset) is False
+
+
+@pytest.mark.parametrize("view", [WordstatView.TOP_POPULAR, WordstatView.TOP_RELATED])
+def test_empty_top_export_is_not_flagged_by_this_gate(view):
+    # Issue #22: TOP_POPULAR/TOP_RELATED are empty on live Wordstat every
+    # time, regardless of phrase — a permanent property of those reports,
+    # not an anomaly (issue #11 recorded an empty CSV for them from a manual
+    # click on the export link, entirely outside this code path, so the DOM
+    # showing rows before the download click does not prove the exported
+    # file cannot be empty). TOP_POPULAR is also the first view in
+    # VIEW_SELECTORS, so flagging it here previously fail-closed every full
+    # collect() run before DYNAMICS/REGIONS were ever reached.
+    assert _is_untrustworthy_empty_export(view, _dataset(view, [])) is False
+
+
+@pytest.mark.parametrize("view", [WordstatView.TOP_POPULAR, WordstatView.TOP_RELATED])
+def test_non_empty_top_export_is_also_trusted(view):
     assert _is_untrustworthy_empty_export(view, _dataset(view, [{"query": "a", "count": "1"}])) is False
 
 

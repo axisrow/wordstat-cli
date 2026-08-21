@@ -55,18 +55,32 @@ class CollectionManifest(BaseModel):
     a manifest on disk that honestly describes what it has so far rather than
     none at all.
 
-    ``exports`` is the single source of truth for completeness: both
-    ``missing_views`` (every :class:`WordstatView` not yet present in
-    ``exports``, in enum declaration order) and ``status`` are *derived* from
-    it via ``computed_field`` rather than stored fields, so there is no way
-    to construct a manifest where they disagree with ``exports`` — the bug
-    this feature exists to avoid (a caller building
-    ``CollectionManifest(exports=[])`` without separately remembering to set
-    ``missing_views`` would otherwise silently get a manifest that lies about
-    being complete). Both are still plain JSON fields in ``manifest.json`` on
-    disk (pydantic includes computed fields in ``model_dump_json`` by
-    default), which is what makes "incomplete" visible to a reader of the
-    file itself, not only on the in-memory object.
+    ``exports`` is the single source of truth for completeness: ``missing_views``
+    (every :class:`WordstatView` not yet present in ``exports``, in enum
+    declaration order), ``empty_views`` (views present in ``exports`` whose
+    ``row_count`` is zero) and ``status`` are all *derived* from it via
+    ``computed_field`` rather than stored fields, so there is no way to
+    construct a manifest where they disagree with ``exports`` — the bug this
+    feature exists to avoid (a caller building ``CollectionManifest(exports=[])``
+    without separately remembering to set ``missing_views`` would otherwise
+    silently get a manifest that lies about being complete). All three are
+    still plain JSON fields in ``manifest.json`` on disk (pydantic includes
+    computed fields in ``model_dump_json`` by default), which is what makes
+    "incomplete" visible to a reader of the file itself, not only on the
+    in-memory object.
+
+    ``empty_views`` exists because of issue #22/#16: ``TOP_POPULAR``/
+    ``TOP_RELATED`` are collected and recorded in ``exports`` even when
+    Wordstat returns them empty (a permanent property of those two reports on
+    live Wordstat, not a collection failure — see
+    ``collector._is_untrustworthy_empty_export``), so they are not
+    "missing" — the run did produce a file for them, with the header schema
+    preserved (issue #18). But a manifest with zero missing views and two
+    zero-row exports must still not read as an unqualified success, or issue
+    #16's original concern (``status: "complete"`` at zero rows) resurfaces
+    for exactly the two views this run legitimately can't fill. ``status``
+    is therefore ``"incomplete"`` if either ``missing_views`` or
+    ``empty_views`` is non-empty, not only the former.
 
     Three timestamp/URL fields describe when and where the data came from,
     and their semantics differ deliberately once ``--resume-dir`` is in
@@ -117,8 +131,13 @@ class CollectionManifest(BaseModel):
 
     @computed_field  # type: ignore[prop-decorator]
     @property
+    def empty_views(self) -> list[WordstatView]:
+        return [export.view for export in self.exports if export.row_count == 0]
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
     def status(self) -> str:
-        return "incomplete" if self.missing_views else "complete"
+        return "incomplete" if self.missing_views or self.empty_views else "complete"
 
     @model_validator(mode="after")
     def _exports_have_unique_views(self) -> "CollectionManifest":
