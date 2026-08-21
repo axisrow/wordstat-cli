@@ -46,9 +46,13 @@ def test_select_view_raises_after_one_retry(monkeypatch, tmp_path):
     async def snapshot(self, page):
         return None
 
+    async def is_active(self, page, selector):
+        return False
+
     monkeypatch.setattr(WordstatCollector, "_click", click)
     monkeypatch.setattr(WordstatCollector, "_wait_for", wait)
     monkeypatch.setattr(WordstatCollector, "_table_snapshot", snapshot)
+    monkeypatch.setattr(WordstatCollector, "_is_view_active", is_active)
 
     with pytest.raises(InterfaceChangedError, match="view did not change"):
         asyncio.run(
@@ -74,9 +78,13 @@ def test_select_view_splits_timeout_budget_across_retries(monkeypatch, tmp_path)
     async def snapshot(self, page):
         return None
 
+    async def is_active(self, page, selector):
+        return False
+
     monkeypatch.setattr(WordstatCollector, "_click", click)
     monkeypatch.setattr(WordstatCollector, "_wait_for", wait)
     monkeypatch.setattr(WordstatCollector, "_table_snapshot", snapshot)
+    monkeypatch.setattr(WordstatCollector, "_is_view_active", is_active)
 
     collector = WordstatCollector("cdp", tmp_path, timeout_seconds=45.0)
     with pytest.raises(InterfaceChangedError):
@@ -104,9 +112,13 @@ def test_select_view_waits_for_table_rows_on_table_based_views(monkeypatch, tmp_
     async def snapshot(self, page):
         return "previous row text"
 
+    async def is_active(self, page, selector):
+        return False
+
     monkeypatch.setattr(WordstatCollector, "_click", click)
     monkeypatch.setattr(WordstatCollector, "_wait_for", wait)
     monkeypatch.setattr(WordstatCollector, "_table_snapshot", snapshot)
+    monkeypatch.setattr(WordstatCollector, "_is_view_active", is_active)
 
     asyncio.run(
         WordstatCollector("cdp", tmp_path)._select_view(object(), "label[for='table']", WordstatView.TOP_POPULAR)
@@ -115,14 +127,15 @@ def test_select_view_waits_for_table_rows_on_table_based_views(monkeypatch, tmp_
     assert ".table__wrapper" in waits[0]
 
 
-def test_select_view_requires_table_content_to_change_on_table_based_views(monkeypatch, tmp_path):
+def test_select_view_requires_table_content_to_change_when_switching_views(monkeypatch, tmp_path):
     # Regression guard (found in review, issue #3's own known-issue note):
     # `checked` + download-button + row-count>0 can all be true while the
     # DOM still shows the *previous* view's rows, silently downloading a
-    # header-only or wrong-view CSV. The readiness predicate must also
-    # require the table's content to differ from what it was right before
-    # the click, mirroring the staleness snapshot _collect_one already uses
-    # for phrase switches.
+    # header-only or wrong-view CSV. When genuinely switching from a
+    # different, currently-inactive view, the readiness predicate must
+    # also require the table's content to differ from what it was right
+    # before the click, mirroring the staleness snapshot _collect_one
+    # already uses for phrase switches.
     waits = []
 
     async def click(self, page, selector):
@@ -134,9 +147,13 @@ def test_select_view_requires_table_content_to_change_on_table_based_views(monke
     async def snapshot(self, page):
         return "stale row from the previous view"
 
+    async def is_active(self, page, selector):
+        return False
+
     monkeypatch.setattr(WordstatCollector, "_click", click)
     monkeypatch.setattr(WordstatCollector, "_wait_for", wait)
     monkeypatch.setattr(WordstatCollector, "_table_snapshot", snapshot)
+    monkeypatch.setattr(WordstatCollector, "_is_view_active", is_active)
 
     asyncio.run(
         WordstatCollector("cdp", tmp_path)._select_view(object(), "label[for='table']", WordstatView.TOP_POPULAR)
@@ -144,6 +161,44 @@ def test_select_view_requires_table_content_to_change_on_table_based_views(monke
 
     assert "stale row from the previous view" in waits[0]
     assert "!==" in waits[0]
+
+
+def test_select_view_skips_content_change_requirement_when_already_active(monkeypatch, tmp_path):
+    # Regression guard (found in review, round 2): the view loop always
+    # starts with TOP_POPULAR, and Wordstat is normally already showing
+    # that exact view right after a phrase search. Clicking an
+    # already-active tab does not change its own table content, so the
+    # content-delta gate must not apply in that case — otherwise the very
+    # first view of every phrase would hang until InterfaceChangedError.
+    waits = []
+    snapshot_calls = 0
+
+    async def click(self, page, selector):
+        pass
+
+    async def wait(self, page, expression, seconds=None, required=True):
+        waits.append(expression)
+
+    async def snapshot(self, page):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return "same row either way"
+
+    async def is_active(self, page, selector):
+        return True
+
+    monkeypatch.setattr(WordstatCollector, "_click", click)
+    monkeypatch.setattr(WordstatCollector, "_wait_for", wait)
+    monkeypatch.setattr(WordstatCollector, "_table_snapshot", snapshot)
+    monkeypatch.setattr(WordstatCollector, "_is_view_active", is_active)
+
+    asyncio.run(
+        WordstatCollector("cdp", tmp_path)._select_view(object(), "label[for='table']", WordstatView.TOP_POPULAR)
+    )
+
+    assert ".table__wrapper" in waits[0]
+    assert "!==" not in waits[0]
+    assert snapshot_calls == 0
 
 
 def test_select_view_does_not_wait_for_table_rows_on_map_view(monkeypatch, tmp_path):

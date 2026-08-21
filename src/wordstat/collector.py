@@ -416,11 +416,26 @@ class WordstatCollector:
         # Row *presence* alone doesn't prove the rows are the new view's,
         # not stale leftovers from the previous one — the same ambiguity
         # `_collect_one` already handles for phrase switches via a table
-        # snapshot. Here the snapshot is a hard gate, not a soft nudge:
-        # unlike two legitimately-similar phrases, two different report
-        # views must never share identical table content, so a timeout
-        # here is a real InterfaceChangedError, not a shrug.
-        previous_table = await self._table_snapshot(page) if view != WordstatView.REGIONS else None
+        # snapshot. A first pass at this (see PR #7 history) snapshotted
+        # the table unconditionally and required it change after the click
+        # — but the view loop always starts with TOP_POPULAR, and Wordstat
+        # is normally already showing that exact view right after a search,
+        # so clicking its own already-active tab has no reason to change
+        # the table at all: the gate was unconditionally unsatisfiable on
+        # the very first view of every phrase (found in review, round 2).
+        #
+        # Fix: read whether the target tab is ALREADY checked before
+        # clicking. If so, Wordstat isn't switching views at all — the
+        # click is a same-view no-op — so only the plain checked+download
+        # (+rows for table views) predicate applies, with no content-delta
+        # requirement. Only when the target tab is genuinely inactive
+        # before the click do we snapshot the table and require its content
+        # to differ, because that is the only case where "did the view
+        # actually repaint" is a real question.
+        was_already_active = view != WordstatView.REGIONS and await self._is_view_active(page, selector)
+        previous_table = (
+            await self._table_snapshot(page) if view != WordstatView.REGIONS and not was_already_active else None
+        )
         target_selector = json.dumps(selector)
         ready_expression = f"""() => {{
             const label = document.querySelector({target_selector});
@@ -431,9 +446,14 @@ class WordstatCollector:
         if view != WordstatView.REGIONS:
             ready_expression += (
                 f"\n                && document.querySelectorAll({json.dumps(TABLE_ROW_SELECTOR)}).length > 0"
-                f"\n                && document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.textContent"
-                f" !== {json.dumps(previous_table)};"
             )
+            if not was_already_active:
+                ready_expression += (
+                    f"\n                && document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.textContent"
+                    f" !== {json.dumps(previous_table)};"
+                )
+            else:
+                ready_expression += ";"
         else:
             ready_expression += ";"
         ready_expression += "\n        }"
@@ -449,6 +469,16 @@ class WordstatCollector:
             except InterfaceChangedError:
                 if attempt == 1:
                     raise
+
+    async def _is_view_active(self, page, selector: str) -> bool:
+        target_selector = json.dumps(selector)
+        result = await page.evaluate(f"""() => {{
+            const label = document.querySelector({target_selector});
+            const input = label?.querySelector('input')
+                ?? (label?.htmlFor ? document.getElementById(label.htmlFor) : null);
+            return Boolean(input?.checked);
+        }}""")
+        return bool(result)
 
     async def _table_snapshot(self, page) -> str | None:
         return await page.evaluate(
