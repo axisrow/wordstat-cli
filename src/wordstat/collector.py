@@ -399,16 +399,27 @@ class WordstatCollector:
         )
 
     async def _select_view(self, page, selector: str) -> None:
-        await self._click(page, selector)
-        # The download button appears as soon as the tab switches, before the
-        # table has actually loaded its rows; downloading at that point
-        # produces a header-only CSV. Wait for at least one data row too.
-        await self._wait_for(
-            page,
-            f"() => Boolean(document.querySelector({json.dumps(DOWNLOAD_SELECTOR)}))"
-            f" && document.querySelectorAll({json.dumps(TABLE_ROW_SELECTOR)}).length > 0",
-        )
-        await asyncio.sleep(0.5)
+        # The download button and old table rows can remain in the DOM while
+        # Wordstat is switching views. The radio input is the actual active
+        # view marker (checked on the live page), and works for the map too,
+        # which has no table rows. Retry the click once if the marker does not
+        # become active before the normal wait timeout.
+        target_selector = json.dumps(selector)
+        ready_expression = f"""() => {{
+            const label = document.querySelector({target_selector});
+            const input = label?.querySelector('input')
+                ?? (label?.htmlFor ? document.getElementById(label.htmlFor) : null);
+            return Boolean(input?.checked)
+                && Boolean(document.querySelector({json.dumps(DOWNLOAD_SELECTOR)}));
+        }}"""
+        for attempt in range(2):
+            await self._click(page, selector)
+            try:
+                await self._wait_for(page, ready_expression)
+                return
+            except InterfaceChangedError:
+                if attempt == 1:
+                    raise
 
     async def _table_snapshot(self, page) -> str | None:
         return await page.evaluate(
