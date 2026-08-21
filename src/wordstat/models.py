@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class WordstatView(StrEnum):
@@ -14,6 +14,13 @@ class WordstatView(StrEnum):
     TOP_RELATED = "top_related"
     DYNAMICS = "dynamics"
     REGIONS = "regions"
+
+
+class CollectionStatus(StrEnum):
+    """Whether every required Wordstat view has been collected."""
+
+    IN_PROGRESS = "in_progress"
+    COMPLETE = "complete"
 
 
 class CsvDataset(BaseModel):
@@ -53,6 +60,16 @@ class CollectionManifest(BaseModel):
     created_at: datetime
     source_url: str
     exports: list[ExportSummary]
+    status: CollectionStatus = CollectionStatus.IN_PROGRESS
+
+    @model_validator(mode="after")
+    def exports_have_unique_views(self) -> "CollectionManifest":
+        """Reject a malformed resume manifest before it can duplicate output."""
+
+        views = [export.view for export in self.exports]
+        if len(views) != len(set(views)):
+            raise ValueError("Manifest contains duplicate view exports")
+        return self
 
 
 class CollectionResult(BaseModel):

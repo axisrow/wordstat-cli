@@ -74,6 +74,12 @@ def _read_phrases_file(path: Path) -> str:
     default=False,
     help="Keep each downloaded CSV as <view>.csv instead of discarding it after conversion.",
 )
+@click.option(
+    "--resume-run",
+    type=click.Path(path_type=Path, exists=True, file_okay=False),
+    default=None,
+    help="Explicit partial run directory to complete; its phrase and region must match.",
+)
 @click.pass_context
 def collect(
     ctx: click.Context,
@@ -84,6 +90,7 @@ def collect(
     cdp_url: str,
     timeout_seconds: float,
     keep_raw: bool,
+    resume_run: Path | None,
 ) -> None:
     """Collect all MVP Wordstat reports for one or more PHRASE as Parquet datasets.
 
@@ -95,6 +102,8 @@ def collect(
     phrases = resolve_phrases(phrase, phrases_file)
     if not phrases:
         raise click.ClickException("At least one search phrase is required")
+    if resume_run is not None and len(phrases) != 1:
+        raise click.ClickException("--resume-run can only be used with one search phrase")
 
     collector = WordstatCollector(
         cdp_url=cdp_url,
@@ -103,7 +112,10 @@ def collect(
         keep_raw=keep_raw,
     )
     try:
-        batch = asyncio.run(collector.collect_many(phrases, region=region))
+        collect_many_kwargs = {"region": region}
+        if resume_run is not None:
+            collect_many_kwargs["resume_run_directory"] = resume_run
+        batch = asyncio.run(collector.collect_many(phrases, **collect_many_kwargs))
     # Only domain errors become friendly messages; an unexpected ValueError
     # from a dependency should keep its traceback instead of being reworded.
     except WordstatError as error:

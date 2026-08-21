@@ -23,11 +23,12 @@ from wordstat.models import (
     BatchCollectionResult,
     CollectionManifest,
     CollectionResult,
+    CollectionStatus,
     ExportSummary,
     PhraseFailure,
     WordstatView,
 )
-from wordstat.storage import create_run_directory, finalize_raw, write_manifest
+from wordstat.storage import create_run_directory, finalize_raw, load_resume_manifest, write_manifest
 
 WORDSTAT_URL = "https://wordstat.yandex.ru/"
 QUERY_SELECTOR = 'input[placeholder="Введите слово или словосочетание"]'
@@ -73,10 +74,12 @@ class WordstatCollector:
         self.timeout_seconds = timeout_seconds
         self.keep_raw = keep_raw
 
-    async def collect(self, phrase: str, region: str = "Россия") -> CollectionResult:
+    async def collect(
+        self, phrase: str, region: str = "Россия", resume_run_directory: Path | None = None
+    ) -> CollectionResult:
         """Collect popular, related, dynamics and regional reports for one phrase."""
 
-        batch = await self.collect_many([phrase], region=region)
+        batch = await self.collect_many([phrase], region=region, resume_run_directory=resume_run_directory)
         if batch.failures:
             raise batch.failures[0].error
         if not batch.results:
@@ -87,7 +90,9 @@ class WordstatCollector:
             raise InvalidRequestError("Collecting the phrase produced neither a result nor a failure")
         return batch.results[0]
 
-    async def collect_many(self, phrases: list[str], region: str = "Россия") -> BatchCollectionResult:
+    async def collect_many(
+        self, phrases: list[str], region: str = "Россия", resume_run_directory: Path | None = None
+    ) -> BatchCollectionResult:
         """Collect reports for several phrases inside a single browser session.
 
         A failure on one phrase is recorded and does not stop the remaining
@@ -106,6 +111,8 @@ class WordstatCollector:
         cleaned_phrases = [phrase.strip() for phrase in phrases]
         if not all(cleaned_phrases):
             raise InvalidRequestError("The search phrase must not be empty")
+        if resume_run_directory is not None and len(cleaned_phrases) != 1:
+            raise InvalidRequestError("--resume-run can only be used with one search phrase")
 
         results: list[CollectionResult] = []
         failures: list[PhraseFailure] = []
@@ -164,15 +171,20 @@ class WordstatCollector:
                         # _collect_one for why the region control can't be
                         # re-selected once a phrase's view loop has run (and
                         # doesn't need to be after that).
-                        result = await self._collect_one(
+                        collect_one_args = (
                             page,
                             session,
                             downloads_path,
                             phrase,
                             region,
-                            set_region=not region_ready,
-                            on_region_applied=_mark_region_ready,
                         )
+                        collect_one_kwargs = {
+                            "set_region": not region_ready,
+                            "on_region_applied": _mark_region_ready,
+                        }
+                        if resume_run_directory is not None:
+                            collect_one_kwargs["resume_run_directory"] = resume_run_directory
+                        result = await self._collect_one(*collect_one_args, **collect_one_kwargs)
                         results.append(result)
                     except AuthenticationRequiredError as error:
                         # The session itself is gone: every remaining phrase
@@ -208,6 +220,7 @@ class WordstatCollector:
         region: str,
         set_region: bool = True,
         on_region_applied: Callable[[], None] | None = None,
+        resume_run_directory: Path | None = None,
     ) -> CollectionResult:
         # Checked once before the batch starts (collect_many), but a session
         # can lose authentication mid-batch (e.g. Yandex logs it out); check
@@ -216,7 +229,13 @@ class WordstatCollector:
         # silently stopped working.
         await self._assert_authenticated(page)
 
-        run_directory = create_run_directory(self.output_root, phrase)
+        if resume_run_directory is None:
+            run_directory = create_run_directory(self.output_root, phrase)
+            manifest_path = run_directory / "manifest.json"
+            manifest: CollectionManifest | None = None
+        else:
+            run_directory = resume_run_directory
+            manifest_path, manifest = load_resume_manifest(run_directory, phrase, region)
         # In a batch, the previous phrase's table can still be sitting in the
         # DOM when _set_phrase's own waits (new `words=` in the URL, download
         # button present) are satisfied — those don't check the table itself.
@@ -252,8 +271,20 @@ class WordstatCollector:
                 required=False,
             )
 
-        exports = []
+        if manifest is None:
+            manifest = CollectionManifest(
+                phrase=phrase,
+                region=region,
+                created_at=datetime.now(UTC),
+                source_url=await page.get_url(),
+                exports=[],
+            )
+            write_manifest(manifest_path, manifest)
+
+        exported_views = {export.view for export in manifest.exports}
         for view, selector in VIEW_SELECTORS.items():
+            if view in exported_views:
+                continue
             await self._select_view(page, selector)
             source = await self._download_current_view(page, session, downloads_path)
             try:
@@ -273,7 +304,7 @@ class WordstatCollector:
                 if source.exists():
                     source.replace(run_directory / source.name)
                 raise
-            exports.append(
+            manifest.exports.append(
                 ExportSummary(
                     view=view,
                     file=data_path.name,
@@ -282,15 +313,9 @@ class WordstatCollector:
                     dtypes=dtypes,
                 )
             )
+            write_manifest(manifest_path, manifest)
 
-        manifest = CollectionManifest(
-            phrase=phrase,
-            region=region,
-            created_at=datetime.now(UTC),
-            source_url=await page.get_url(),
-            exports=exports,
-        )
-        manifest_path = run_directory / "manifest.json"
+        manifest.status = CollectionStatus.COMPLETE
         write_manifest(manifest_path, manifest)
         return CollectionResult(
             run_directory=run_directory,

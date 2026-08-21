@@ -14,7 +14,8 @@ import pytest
 import wordstat.collector as collector_module
 from wordstat.collector import WordstatCollector
 from wordstat.errors import AuthenticationRequiredError, InvalidRequestError, PhraseEntryError
-from wordstat.models import CollectionManifest, CollectionResult
+from wordstat.models import CollectionManifest, CollectionResult, CollectionStatus, ExportSummary, WordstatView
+from wordstat.storage import write_manifest
 
 
 def _fake_result(tmp_path, phrase) -> CollectionResult:
@@ -455,3 +456,74 @@ def test_collect_one_rescue_does_not_error_when_finalize_raw_already_moved_the_f
     # Must raise the original RuntimeError, not a FileNotFoundError from the
     # rescue trying to move an already-moved file.
     asyncio.run(run())
+
+    run_directory = next(tmp_path.glob("runs/*"))
+    manifest = CollectionManifest.model_validate_json((run_directory / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest.status is CollectionStatus.IN_PROGRESS
+    assert [export.view for export in manifest.exports] == [WordstatView.TOP_POPULAR]
+
+
+def test_collect_one_resume_keeps_existing_exports_and_completes_missing_views(monkeypatch, tmp_path):
+    """A resume uses the supplied partial run and never rewrites its completed view."""
+
+    _patch_common(monkeypatch)
+    run_directory = tmp_path / "existing-run"
+    run_directory.mkdir()
+    existing_file = run_directory / "top_popular.parquet"
+    existing_file.write_text("original top popular dataset", encoding="utf-8")
+    write_manifest(
+        run_directory / "manifest.json",
+        CollectionManifest(
+            phrase="тест",
+            region="Россия",
+            created_at=datetime(2026, 8, 20, 12, 0, tzinfo=UTC),
+            source_url="https://wordstat.yandex.ru/?words=тест",
+            exports=[
+                ExportSummary(
+                    view=WordstatView.TOP_POPULAR,
+                    file=existing_file.name,
+                    raw_file=None,
+                    row_count=1,
+                    dtypes={"Запрос": "string"},
+                )
+            ],
+        ),
+    )
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+    downloaded_views = []
+
+    async def fake_select_view(self, page, selector):
+        downloaded_views.append(selector)
+
+    async def fake_download(self, page, session, dl_path):
+        source = dl_path / f"export-{len(downloaded_views)}.csv"
+        _write_view_csv(source, "тест")
+        return source
+
+    def fake_write_dataset(dataset, destination):
+        path = destination / f"{dataset.view.value}.parquet"
+        path.write_text(f"new {dataset.view.value} dataset", encoding="utf-8")
+        return path, {"Запрос": "string"}
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+    monkeypatch.setattr(collector_module, "write_dataset", fake_write_dataset)
+
+    collector = WordstatCollector("cdp", tmp_path)
+    result = asyncio.run(
+        collector._collect_one(
+            _FakePage(),
+            _FakeSession(),
+            downloads_path,
+            "тест",
+            "Россия",
+            resume_run_directory=run_directory,
+        )
+    )
+
+    assert len(downloaded_views) == 3
+    assert existing_file.read_text(encoding="utf-8") == "original top popular dataset"
+    assert result.run_directory == run_directory
+    assert result.manifest.status is CollectionStatus.COMPLETE
+    assert [export.view for export in result.manifest.exports] == list(WordstatView)
