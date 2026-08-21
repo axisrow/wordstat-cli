@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import tempfile
 import time
 from collections.abc import Callable
@@ -55,6 +56,19 @@ VIEW_SELECTORS = {
     WordstatView.DYNAMICS: "label[for='graph']",
     WordstatView.REGIONS: "label[for='map']",
 }
+# The live interface is Russian; map explicitly rather than depending on the
+# host locale. Shared by every place that needs a Russian month name (the
+# calendar popups and the applied-period wait below), so there is exactly
+# one list to keep in sync with the live UI's wording. Nominative form —
+# what the calendar popups' option labels use ("январь", "декабрь").
+RUSSIAN_MONTHS = "январь февраль март апрель май июнь июль август сентябрь октябрь ноябрь декабрь".split()
+# Genitive form — what the dynamics table's first cell uses for daily/weekly
+# rows ("22 июня", "24 декабря 2018": "of June", "of December"). Confirmed
+# live (issue #6 phase 1/2 documents) that this differs from RUSSIAN_MONTHS;
+# a fixed nominative-month match against this genitive text never matches.
+RUSSIAN_MONTHS_GENITIVE = (
+    "января февраля марта апреля мая июня июля августа сентября октября ноября декабря".split()
+)
 
 
 def _is_untrustworthy_empty_export(view: WordstatView, dataset: CsvDataset) -> bool:
@@ -555,7 +569,47 @@ class WordstatCollector:
         await self._select_calendar_date(page, popup_type, date_from)
         await self._click(page, DATE_RANGE_SELECTOR)
         await self._select_calendar_date(page, popup_type, date_to)
-        await self._wait_for_table_granularity(page, granularity)
+        # _wait_for_table_granularity alone is not enough here: it only
+        # checks that the first cell's *format* matches the granularity
+        # (e.g. "looks like a week range"), which is already true of the
+        # table's pre-existing content before the period change has been
+        # applied. Live CDP checks (issue #6 phase 2) caught this exact
+        # race: the date-range button already showed the newly picked
+        # dates, _wait_for_table_granularity's format check passed
+        # immediately, and the exported CSV still carried Wordstat's
+        # default window — the table's *values* had not caught up yet.
+        # Waiting for the first cell to actually start at the expected
+        # date closes that gap, and turns a silent wrong-period export
+        # into a loud InterfaceChangedError if the picker never catches up.
+        await self._wait_for_period_applied(page, granularity, date_from)
+
+    async def _wait_for_period_applied(self, page, granularity: Granularity, date_from: date) -> None:
+        # The month name in the first cell is genitive ("22 июня", "24
+        # декабря" — day-of/week-of a date) for daily/weekly, but
+        # nominative ("август 2024") for monthly (confirmed live, issue #6
+        # phase 1/2 documents) — hence two separate month lists rather than
+        # one. Matching the exact expected month (not just "any month word")
+        # matters: without it, "24 <any month> 2018" would silently accept
+        # a wrong month picked by a stuck calendar, defeating the point of
+        # this wait (confirmed as a real gap during review, not just theory).
+        if granularity is Granularity.MONTHLY:
+            expected = f"{RUSSIAN_MONTHS[date_from.month - 1]} {date_from.year}"
+        elif granularity is Granularity.DAILY:
+            expected = f"{date_from.day} {RUSSIAN_MONTHS_GENITIVE[date_from.month - 1]}"
+        else:
+            # Weekly's first cell is the Monday of date_from's week, not
+            # date_from itself (confirmed live: 2018-12-26, a Wednesday,
+            # produced a first cell starting "24 декабря" — the preceding
+            # Monday). Wordstat does this alignment itself; not a bug.
+            week_start = date_from - timedelta(days=date_from.weekday())
+            expected = f"{week_start.day} {RUSSIAN_MONTHS_GENITIVE[week_start.month - 1]} {week_start.year}"
+        pattern = "^" + re.escape(expected)
+        await self._wait_for(
+            page,
+            f"() => new RegExp({json.dumps(pattern)}).test("
+            f"document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.querySelector('td')"
+            "?.textContent?.trim() ?? '')",
+        )
 
     async def _wait_for_table_granularity(self, page, granularity: Granularity) -> None:
         patterns = {
@@ -576,24 +630,13 @@ class WordstatCollector:
             f"() => [...document.querySelectorAll({json.dumps(root)})].some((x) => "
             "x.offsetParent !== null && getComputedStyle(x).visibility !== 'hidden')",
         )
+        month_label = RUSSIAN_MONTHS[target.month - 1]
         if popup_type == "month":
             year_selector = f"{root} .datepicker-month__years_select > button"
             month_selector = f"{root} .react-datepicker__month-text"
-            # The live interface is Russian; map explicitly rather than
-            # depending on the host locale.
-            month_label = (
-                "январь февраль март апрель май июнь июль август сентябрь октябрь ноябрь декабрь".split()[
-                    target.month - 1
-                ]
-            )
         else:
             year_selector = f"{root} .range-datepicker__years_select > button"
             month_selector = f"{root} .range-datepicker__months_select > button"
-            month_label = (
-                "январь февраль март апрель май июнь июль август сентябрь октябрь ноябрь декабрь".split()[
-                    target.month - 1
-                ]
-            )
         await self._click(page, year_selector)
         await self._click_visible_text(page, ".Popup2_visible [role='option']", str(target.year))
         if popup_type in {"day", "week"}:

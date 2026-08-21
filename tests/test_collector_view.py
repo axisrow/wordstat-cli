@@ -1,12 +1,15 @@
 """View-selection retry behavior without touching a browser."""
 
 import asyncio
+import re
+from datetime import date
 
 import pytest
 
 from wordstat.collector import WordstatCollector, _is_untrustworthy_empty_export
 from wordstat.errors import InterfaceChangedError
 from wordstat.models import CsvDataset, WordstatView
+from wordstat.periods import Granularity
 
 
 def test_select_view_retries_once_when_active_marker_does_not_change(monkeypatch, tmp_path):
@@ -197,3 +200,64 @@ def test_select_view_does_not_wait_for_table_rows_on_map_view(monkeypatch, tmp_p
     asyncio.run(WordstatCollector("cdp", tmp_path)._select_view(object(), "label[for='map']", WordstatView.REGIONS))
 
     assert ".table__wrapper" not in waits[0]
+
+
+# _wait_for_period_applied's regex must match the live table's actual text.
+# Daily/weekly first cells are genitive ("22 июня", "24 декабря 2018" — "of
+# June", "of December"), unlike the nominative RUSSIAN_MONTHS list used for
+# clicking the calendar popups ("июнь", "декабрь"). A live CDP check (issue
+# #6 phase 2) confirmed a fixed nominative-month match against the live
+# cell's genitive text never matches, so _wait_for ran out its full timeout
+# every time instead of detecting the period was actually already applied.
+# These are regression guards for that exact mismatch, not for the general
+# _wait_for polling mechanism (already covered above).
+def _captured_pattern(monkeypatch, tmp_path):
+    captured = {}
+
+    async def wait(self, page, expression, seconds=None, required=True):
+        captured["expression"] = expression
+
+    monkeypatch.setattr(WordstatCollector, "_wait_for", wait)
+    return WordstatCollector("cdp", tmp_path), captured
+
+
+def _extract_regex(expression: str) -> re.Pattern:
+    # _wait_for_period_applied builds "new RegExp(<json-encoded pattern>)...".
+    # Extract and compile the same pattern the live page would receive.
+    import json
+
+    start = expression.index("new RegExp(") + len("new RegExp(")
+    end = expression.index(")", start)
+    pattern = json.loads(expression[start:end])
+    return re.compile(pattern)
+
+
+def test_wait_for_period_applied_daily_matches_genitive_cell_text(monkeypatch, tmp_path):
+    collector, captured = _captured_pattern(monkeypatch, tmp_path)
+    asyncio.run(collector._wait_for_period_applied(object(), Granularity.DAILY, date(2026, 6, 22)))
+    pattern = _extract_regex(captured["expression"])
+    assert pattern.search("22 июня")
+    assert not pattern.search("23 июня")
+    # The month must match exactly, not just "some month word" — a stuck
+    # calendar that landed on the right day of a wrong month must still
+    # fail this check (found in review: an early version anchored only on
+    # day+year and would have silently accepted this).
+    assert not pattern.search("22 июля")
+
+
+def test_wait_for_period_applied_weekly_matches_genitive_cell_text_and_aligns_to_monday(monkeypatch, tmp_path):
+    collector, captured = _captured_pattern(monkeypatch, tmp_path)
+    # 2018-12-26 is a Wednesday; the first cell is the Monday of that week.
+    asyncio.run(collector._wait_for_period_applied(object(), Granularity.WEEKLY, date(2018, 12, 26)))
+    pattern = _extract_regex(captured["expression"])
+    assert pattern.search("24 декабря 2018 – 30 декабря 2018")
+    assert not pattern.search("31 декабря 2018 – 6 января 2019")
+    assert not pattern.search("24 ноября 2018 – 30 ноября 2018")
+
+
+def test_wait_for_period_applied_monthly_matches_nominative_cell_text(monkeypatch, tmp_path):
+    collector, captured = _captured_pattern(monkeypatch, tmp_path)
+    asyncio.run(collector._wait_for_period_applied(object(), Granularity.MONTHLY, date(2024, 8, 1)))
+    pattern = _extract_regex(captured["expression"])
+    assert pattern.search("август 2024")
+    assert not pattern.search("сентябрь 2024")
