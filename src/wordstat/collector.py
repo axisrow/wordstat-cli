@@ -412,6 +412,15 @@ class WordstatCollector:
         # issue #3 and the known-issue note in CLAUDE.md). REGIONS (the
         # map) has no table rows at all, so it is exempt from this extra
         # gate — requiring row presence there would hang forever.
+        #
+        # Row *presence* alone doesn't prove the rows are the new view's,
+        # not stale leftovers from the previous one — the same ambiguity
+        # `_collect_one` already handles for phrase switches via a table
+        # snapshot. Here the snapshot is a hard gate, not a soft nudge:
+        # unlike two legitimately-similar phrases, two different report
+        # views must never share identical table content, so a timeout
+        # here is a real InterfaceChangedError, not a shrug.
+        previous_table = await self._table_snapshot(page) if view != WordstatView.REGIONS else None
         target_selector = json.dumps(selector)
         ready_expression = f"""() => {{
             const label = document.querySelector({target_selector});
@@ -421,15 +430,21 @@ class WordstatCollector:
                 && Boolean(document.querySelector({json.dumps(DOWNLOAD_SELECTOR)}))"""
         if view != WordstatView.REGIONS:
             ready_expression += (
-                f"\n                && document.querySelectorAll({json.dumps(TABLE_ROW_SELECTOR)}).length > 0;"
+                f"\n                && document.querySelectorAll({json.dumps(TABLE_ROW_SELECTOR)}).length > 0"
+                f"\n                && document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.textContent"
+                f" !== {json.dumps(previous_table)};"
             )
         else:
             ready_expression += ";"
         ready_expression += "\n        }"
+        # Two attempts must not cost double the configured timeout budget
+        # (issue found in review): split it so the worst case across both
+        # attempts still matches self.timeout_seconds, not 2x it.
+        attempt_seconds = self.timeout_seconds / 2
         for attempt in range(2):
             await self._click(page, selector)
             try:
-                await self._wait_for(page, ready_expression)
+                await self._wait_for(page, ready_expression, seconds=attempt_seconds)
                 return
             except InterfaceChangedError:
                 if attempt == 1:
