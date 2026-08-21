@@ -1,4 +1,8 @@
-"""CSV decoding for Wordstat downloads."""
+"""CSV decoding for Wordstat downloads.
+
+Wordstat exports are commonly UTF-8 with a BOM and may use a lone CR as the
+line terminator.  ``cp1251`` remains a supported fallback for older exports.
+"""
 
 import csv
 from collections.abc import Iterable
@@ -8,6 +12,12 @@ from wordstat.errors import CsvFormatError
 from wordstat.models import CsvDataset, WordstatView
 
 _ENCODINGS = ("utf-8-sig", "utf-8", "cp1251")
+
+
+class _SemicolonDialect(csv.excel):
+    """Fallback dialect for Wordstat's known separator."""
+
+    delimiter = ";"
 
 
 def parse_wordstat_csv(path: Path, view: WordstatView) -> CsvDataset:
@@ -40,11 +50,16 @@ def _read_text(path: Path) -> str:
 
 
 def _detect_dialect(text: str) -> csv.Dialect:
+    # Sniffer cannot establish a delimiter from a header-only export.  Do not
+    # let its Excel fallback turn commas inside a localized header into
+    # columns; Wordstat's separator is semicolon.
+    if len(text.splitlines()) < 2:
+        return _SemicolonDialect()
     sample = text[:4096]
     try:
         return csv.Sniffer().sniff(sample, delimiters=";,\t")
     except csv.Error:
-        return csv.excel
+        return _SemicolonDialect()
 
 
 def _validate_headers(fieldnames: Iterable[str | None] | None, path: Path) -> list[str]:
@@ -53,6 +68,8 @@ def _validate_headers(fieldnames: Iterable[str | None] | None, path: Path) -> li
     headers = [header.strip() if header else "" for header in fieldnames]
     if not all(headers):
         raise CsvFormatError(f"CSV {path.name} contains an empty header")
+    if any(";" in header for header in headers):
+        raise CsvFormatError(f"CSV {path.name} contains an unparsed delimiter in a header")
     if len(set(headers)) != len(headers):
         raise CsvFormatError(f"CSV {path.name} contains duplicate headers")
     return headers
