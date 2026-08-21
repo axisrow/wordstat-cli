@@ -23,6 +23,7 @@ from wordstat.models import (
     BatchCollectionResult,
     CollectionManifest,
     CollectionResult,
+    CsvDataset,
     ExportSummary,
     PhraseFailure,
     WordstatView,
@@ -51,6 +52,51 @@ VIEW_SELECTORS = {
     WordstatView.DYNAMICS: "label[for='graph']",
     WordstatView.REGIONS: "label[for='map']",
 }
+
+
+def _is_untrustworthy_empty_export(view: WordstatView, dataset: CsvDataset) -> bool:
+    """True if an empty CSV for this view can never be a legitimate export.
+
+    TOP_POPULAR/TOP_RELATED/DYNAMICS are checked — every view for which
+    _select_view hard-gates TABLE_ROW_SELECTOR.length > 0 on the DOM before
+    the "Скачать" click is ever issued (see the docstring on _select_view
+    and CLAUDE.md's issue #3/#13 section). REGIONS is the only view exempt
+    from that gate (it is a map with no table rows in its DOM), so it is the
+    only view exempt here too — this set must stay in lockstep with
+    _select_view's `if view != WordstatView.REGIONS:` condition, not be
+    picked per-view by hand.
+
+    A phrase that clears the pre-download gate has already had the code
+    itself prove TABLE_ROW_SELECTOR.length > 0 moments earlier; genuinely
+    zero rows never reaches the download step at all — it dies inside
+    _select_view's retry loop with InterfaceChangedError instead. So by the
+    time a dataset for one of these views is parsed here, an empty
+    dataset.rows already contradicts a state the code itself proved moments
+    earlier; there is no code path left where that emptiness is legitimate,
+    for any of the three table-based views alike.
+
+    This used to be conditioned on a second, post-download DOM read
+    (`rendered_rows > 0`) — but re-querying the DOM after the download's
+    unbounded polling window can observe a table that has since emptied
+    (rerender, auth transition, page degradation), which let the empty
+    export through as an apparently valid `row_count: 0` and silently
+    corrupt the manifest into `status: "complete"` — the exact failure mode
+    issue #11's fix was meant to close. The pre-download gate is already
+    proof enough; no second opinion from a later DOM read is needed or
+    trustworthy. See tests/test_collector_view.py.
+
+    DYNAMICS was previously excluded on the strength of issue #11's live-CDP
+    data (24 rows across three runs, never empty) — but that is evidence the
+    gate rarely fires for DYNAMICS, not evidence that omitting it is safe.
+    The gate's premise is structural (the DOM proved rows>0 immediately
+    before the click), and that premise holds for DYNAMICS exactly as it
+    does for TOP_POPULAR/TOP_RELATED; selecting views by observed frequency
+    of emptiness rather than by the structural gate they share was the bug.
+    """
+    return (
+        view in (WordstatView.TOP_POPULAR, WordstatView.TOP_RELATED, WordstatView.DYNAMICS)
+        and not dataset.rows
+    )
 
 
 def _without_traceback(error: Exception) -> Exception:
@@ -337,6 +383,11 @@ class WordstatCollector:
                 # Convert before disposing of the download, so a parse or
                 # write failure leaves the raw CSV on disk to inspect.
                 dataset = parse_wordstat_csv(source, view)
+                if _is_untrustworthy_empty_export(view, dataset):
+                    raise InterfaceChangedError(
+                        f"Wordstat returned an empty {view.value} CSV, but the page had rendered at "
+                        "least one table row before the download was triggered; export is not trustworthy"
+                    )
                 data_path, dtypes = write_dataset(dataset, run_directory)
                 raw_path = finalize_raw(source, run_directory, view, self.keep_raw)
             except Exception:  # noqa: BLE001
