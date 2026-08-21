@@ -451,7 +451,7 @@ def test_collect_one_preserves_a_table_snapshot_for_the_next_phrase(monkeypatch,
         download_count += 1
         source = directory / f"export-{download_count}.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     monkeypatch.setattr(WordstatCollector, "_assert_authenticated", noop)
     monkeypatch.setattr(WordstatCollector, "_set_phrase", noop)
@@ -496,7 +496,7 @@ def test_collect_one_rescues_the_csv_into_the_run_directory_on_write_failure(mon
         call_count["n"] += 1
         source = dl_path / f"export-{call_count['n']}.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     def failing_write_dataset(dataset, run_directory):
         raise RuntimeError("simulated pyarrow.ArrowInvalid")
@@ -539,7 +539,7 @@ def test_collect_one_rescue_does_not_error_when_finalize_raw_already_moved_the_f
     async def fake_download(self, page, session, dl_path):
         source = dl_path / "export.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     view_calls = {"n": 0}
 
@@ -605,7 +605,7 @@ def test_collect_one_returns_a_partial_result_when_one_view_fails(monkeypatch, t
             raise DownloadTimeoutError("simulated: Wordstat never produced a CSV for regions")
         source = dl_path / f"export-{call_count['n']}.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
     monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
@@ -653,7 +653,7 @@ def test_collect_one_records_untried_views_after_a_non_final_view_fails(monkeypa
             raise DownloadTimeoutError("simulated: top_related never downloaded")
         source = dl_path / f"export-{call_count['n']}.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
     monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
@@ -704,7 +704,7 @@ def test_collect_one_still_propagates_authentication_loss_mid_phrase(monkeypatch
             raise AuthenticationRequiredError("simulated: session logged out mid-phrase")
         source = dl_path / f"export-{call_count['n']}.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
     monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
@@ -772,7 +772,7 @@ def test_collect_one_writes_the_manifest_after_every_view_not_only_at_the_end(mo
         call_count["n"] += 1
         source = dl_path / f"export-{call_count['n']}.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     seen_statuses = []
     real_write_manifest = collector_module.write_manifest
@@ -833,7 +833,7 @@ def test_collect_one_resume_directory_only_collects_missing_views(monkeypatch, t
             raise RuntimeError("simulated interruption")
         source = dl_path / "export-1.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
     monkeypatch.setattr(WordstatCollector, "_download_current_view", failing_after_first_download)
@@ -867,7 +867,7 @@ def test_collect_one_resume_directory_only_collects_missing_views(monkeypatch, t
         call_count["n"] += 1
         source = dl_path / f"resume-{call_count['n']}.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     monkeypatch.setattr(WordstatCollector, "_download_current_view", succeeding_download)
 
@@ -903,7 +903,7 @@ def test_collect_one_resume_directory_rejects_a_different_phrase(monkeypatch, tm
     async def fake_download(self, page, session, dl_path):
         source = dl_path / "export.csv"
         _write_view_csv(source, "чай")
-        return source
+        return source, None
 
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
     monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
@@ -985,7 +985,7 @@ def test_collect_one_resume_updates_source_url_and_updated_at_but_not_created_at
     async def succeeding_download(self, page, session, dl_path):
         source = dl_path / "export.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     monkeypatch.setattr(WordstatCollector, "_download_current_view", succeeding_download)
 
@@ -1033,7 +1033,7 @@ def test_collect_one_resume_of_an_already_complete_run_does_not_touch_the_manife
     async def fake_download(self, page, session, dl_path):
         source = dl_path / "export.csv"
         _write_view_csv(source, "тест")
-        return source
+        return source, None
 
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
     monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)

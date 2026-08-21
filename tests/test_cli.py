@@ -190,6 +190,101 @@ def test_batch_partial_phrase_exits_zero_and_reports_the_missing_view(monkeypatc
     assert "чай [regions]: DownloadTimeoutError: simulated" in result.output
 
 
+def _fake_manifest_with_stale_export_for_regions(phrase: str) -> CollectionManifest:
+    """All four views present in exports, including a *stale* REGIONS entry
+    (as if a prior run collected it, but the on-disk parquet was later
+    deleted) — mirrors --resume-dir's views_to_collect re-attempting a view
+    whose export entry survives but whose file doesn't (see storage.py). With
+    all four exports present, `missing_views` (computed only from `exports`)
+    is empty even though this call's re-collection of REGIONS failed."""
+    base = _fake_manifest_with_missing_view(phrase)
+    return base.model_copy(
+        update={
+            "exports": [
+                *base.exports,
+                ExportSummary(
+                    view=WordstatView.REGIONS,
+                    file="regions.parquet",
+                    raw_file=None,
+                    row_count=934,
+                    dtypes={"Регион": "string"},
+                ),
+            ]
+        }
+    )
+
+
+def test_batch_resume_reattempt_failure_is_reported_even_when_missing_views_is_empty(
+    monkeypatch, tmp_path: Path
+):
+    """Cycle-review follow-up to issue #27: missing_views is a computed field
+    over manifest.exports only. Under --resume-dir, a view can have a stale
+    export entry (its parquet was manually deleted, but the manifest still
+    lists it) — views_to_collect re-attempts such a view, and if that
+    re-attempt fails, view_errors gets an entry for it but missing_views
+    stays empty (the stale export entry is still in manifest.exports). Keying
+    the CLI's partial-report gate on `missing_views` alone would silently
+    report this run as a full success at exit 0 while the view's parquet is
+    still absent — the exact "врёт о фактическом результате" failure mode
+    issue #27 was about. The gate must be the union of missing_views and
+    view_errors."""
+
+    async def fake_collect_many(self, phrases, region="Россия", resume_directory=None):
+        run_directory = tmp_path / "чай"
+        manifest_path = run_directory / "manifest.json"
+        return BatchCollectionResult(
+            total=1,
+            results=[
+                CollectionResult(
+                    run_directory=run_directory,
+                    manifest_path=manifest_path,
+                    manifest=_fake_manifest_with_stale_export_for_regions("чай"),
+                    view_errors={WordstatView.REGIONS: "DownloadTimeoutError: simulated resume re-attempt failure"},
+                )
+            ],
+            failures=[],
+        )
+
+    monkeypatch.setattr(cli.WordstatCollector, "collect_many", fake_collect_many)
+
+    result = CliRunner().invoke(main, ["collect", "чай"])
+
+    assert result.exit_code == 0
+    assert "Собрано 1 из 1, из них частично 1" in result.output
+    assert "чай [regions]: DownloadTimeoutError: simulated resume re-attempt failure" in result.output
+
+
+def test_batch_reports_escaped_download_warnings(monkeypatch, tmp_path: Path):
+    """A view that succeeded despite a same-tick escaped download (cycle-
+    review follow-up to issue #27) must still surface the warning to the
+    operator, even though the phrase is otherwise fully collected."""
+
+    async def fake_collect_many(self, phrases, region="Россия", resume_directory=None):
+        run_directory = tmp_path / "чай"
+        manifest_path = run_directory / "manifest.json"
+        return BatchCollectionResult(
+            total=1,
+            results=[
+                CollectionResult(
+                    run_directory=run_directory,
+                    manifest_path=manifest_path,
+                    manifest=_fake_manifest_with_stale_export_for_regions("чай"),
+                    escaped_download_warnings=[
+                        "[regions] Chrome reported a download outside the run's downloads directory: stray.csv"
+                    ],
+                )
+            ],
+            failures=[],
+        )
+
+    monkeypatch.setattr(cli.WordstatCollector, "collect_many", fake_collect_many)
+
+    result = CliRunner().invoke(main, ["collect", "чай"])
+
+    assert result.exit_code == 0
+    assert "чай: [regions] Chrome reported a download outside the run's downloads directory" in result.output
+
+
 def test_batch_aborted_early_reports_untried_phrases_distinctly(monkeypatch):
     async def fake_collect_many(self, phrases, region="Россия", resume_directory=None):
         # Only the first of 3 phrases was attempted (and failed) before the

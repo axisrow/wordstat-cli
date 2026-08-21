@@ -181,11 +181,27 @@ def collect(
         # top_popular/top_related are legitimately empty on every live
         # Wordstat run (issue #22/#25) — keying success on status would
         # make ordinary complete runs exit 1 again.
-        if result.manifest.missing_views:
+        #
+        # Union with view_errors, not manifest.missing_views alone (cycle-review
+        # follow-up to #27): missing_views is a computed field over
+        # manifest.exports only, which under --resume-dir can still list a view
+        # as "exported" from a *prior* run even though that view's parquet is
+        # gone from disk and this run's re-collection attempt failed for it
+        # (views_to_collect re-attempts a view whose export entry survives but
+        # whose file doesn't — see storage.py). In that case view_errors has an
+        # entry for the view but missing_views is empty, so keying only off
+        # missing_views silently reported a run with a missing parquet as a
+        # full, error-free success at exit 0 — the exact "врёт о фактическом
+        # результате" failure mode issue #27 was about, just from the opposite
+        # direction (a stale manifest entry instead of a fresh gap).
+        reported_views = set(result.manifest.missing_views) | set(result.view_errors)
+        if reported_views:
             partial_count += 1
-            for view in result.manifest.missing_views:
+            for view in sorted(reported_views, key=lambda v: v.value):
                 reason = result.view_errors.get(view, "не собран")
                 click.echo(f"  {result.manifest.phrase} [{view.value}]: {reason}", err=True)
+        for warning in result.escaped_download_warnings:
+            click.echo(f"  {result.manifest.phrase}: {warning}", err=True)
     for failure in batch.failures:
         click.echo(f"{failure.phrase}: {failure.error}", err=True)
 

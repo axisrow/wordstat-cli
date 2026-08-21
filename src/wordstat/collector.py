@@ -507,6 +507,7 @@ class WordstatCollector:
         # sees it and breaks the batch (see that method's own comment on
         # why it must be checked before the generic Exception branch).
         view_errors: dict[WordstatView, str] = {}
+        escaped_download_warnings: list[str] = []
         last_view_error: Exception | None = None
         for view_index, view in enumerate(pending_views):
             try:
@@ -524,7 +525,9 @@ class WordstatCollector:
                     await self._set_granularity(page, granularity)
                     if date_from is not None:
                         await self._set_period(page, granularity, date_from, date_to)
-                source = await self._download_current_view(page, session, downloads_path)
+                source, escape_warning = await self._download_current_view(page, session, downloads_path)
+                if escape_warning is not None:
+                    escaped_download_warnings.append(f"[{view.value}] {escape_warning}")
                 try:
                     # Convert before disposing of the download, so a parse or
                     # write failure leaves the raw CSV on disk to inspect. The
@@ -534,7 +537,9 @@ class WordstatCollector:
                     if _is_untrustworthy_empty_export(view, dataset):
                         if self.empty_export_retry_seconds > 0:
                             await asyncio.sleep(self.empty_export_retry_seconds)
-                        source = await self._download_current_view(page, session, downloads_path)
+                        source, escape_warning = await self._download_current_view(page, session, downloads_path)
+                        if escape_warning is not None:
+                            escaped_download_warnings.append(f"[{view.value}] {escape_warning}")
                         dataset = parse_wordstat_csv(source, view)
                     if _is_untrustworthy_empty_export(view, dataset):
                         raise InterfaceChangedError(
@@ -627,6 +632,7 @@ class WordstatCollector:
             manifest_path=manifest_path,
             manifest=manifest,
             view_errors=view_errors,
+            escaped_download_warnings=escaped_download_warnings,
         )
 
     @staticmethod
@@ -1087,7 +1093,26 @@ class WordstatCollector:
             f"() => document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.textContent ?? null"
         )
 
-    async def _download_current_view(self, page, session: BrowserSession, downloads_path: Path) -> Path:
+    async def _download_current_view(
+        self, page, session: BrowserSession, downloads_path: Path
+    ) -> tuple[Path, str | None]:
+        """Download the CSV for the currently selected view.
+
+        Returns ``(path, escape_warning)``. ``escape_warning`` is ``None`` on
+        the common path; it carries a message when a stray escaped download
+        (see ``DownloadEscapedError`` below) was observed in the very same
+        poll tick as the legitimate CSV (issue #27 follow-up). That case
+        must not fail the view — the view's own CSV is fine and already on
+        disk — but the operator still needs to know Chrome dropped a file
+        outside ``downloads_path`` somewhere. Checking ``new_escaped`` only
+        applies when no legitimate CSV was found in this tick would silently
+        lose that signal forever: ``session.downloaded_files`` is
+        session-lifetime and append-only, so the same path is already inside
+        next call's ``before_escaped`` baseline and would never show up in a
+        future ``new_escaped`` diff either — this is not a "check it next
+        time" gap, the escape is gone from view for good once masked by a
+        same-tick success.
+        """
         # macOS resolves /tmp to /private/tmp; the downloads directory and
         # session.downloaded_files can report the same physical file under
         # different unresolved paths, which would otherwise look like two
@@ -1107,8 +1132,28 @@ class WordstatCollector:
             current = self._resolved_file_snapshot(downloads_path, session)
             new_resolved = set(current) - set(before)
             csv_files = [current[resolved] for resolved in new_resolved if resolved.suffix.lower() == ".csv"]
+            # Evaluated every tick, including the one that finds the
+            # legitimate CSV: a stray escaped path can land in the exact
+            # same tick as a good download, and (per the docstring above)
+            # that escape would never be detected on any later call either
+            # once masked here — this is the only tick in which it is ever
+            # observable at all.
+            new_escaped = self._escaped_download_paths(downloads_path, session) - before_escaped
+            escape_warning = (
+                "Chrome reported a download outside the run's downloads directory "
+                f"({downloads_path}): {sorted(str(path) for path in new_escaped)}. "
+                "The file was left untouched; it is not safe to move or delete "
+                "automatically. Move it manually if it belongs to this run."
+                if new_escaped
+                else None
+            )
             if len(csv_files) == 1 and csv_files[0].stat().st_size > 0:
-                return csv_files[0]
+                # The view's own download succeeded — a stray escape seen in
+                # this same tick is reported as a warning, not a failure: the
+                # data this view needed is safely on disk, and raising here
+                # would discard it for no reason (see the docstring above for
+                # why this is the only chance to report the escape at all).
+                return csv_files[0], escape_warning
             if len(csv_files) > 1:
                 raise DownloadTimeoutError("Wordstat produced more than one new CSV for a single export")
             # Chrome can report a download at a path outside downloads_path
@@ -1138,7 +1183,6 @@ class WordstatCollector:
             # run) — but it must fail loudly and specifically instead of a
             # generic DownloadTimeoutError that leaves the operator guessing
             # whether Wordstat ever produced anything at all.
-            new_escaped = self._escaped_download_paths(downloads_path, session) - before_escaped
             if new_escaped:
                 raise DownloadEscapedError(
                     "Chrome reported a download outside the run's downloads directory "

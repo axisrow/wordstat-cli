@@ -167,12 +167,24 @@ class CollectionResult(BaseModel):
     itself here would hold its traceback/frames alive for as long as this
     result is (same reasoning as ``PhraseFailure.error`` being stripped of
     its traceback in ``collector._without_traceback``).
+
+    ``escaped_download_warnings`` (issue #27 follow-up) records a case where
+    Chrome reported a download outside the run's ``downloads_path`` in the
+    same polling tick as the legitimate CSV for the current view — the view
+    itself still succeeded (its own CSV is fine), so this must not fail the
+    view or the phrase, but the operator still needs to know Chrome dropped
+    a stray file somewhere it wasn't supposed to (the file itself is never
+    touched — see ``_escaped_download_paths``/``DownloadEscapedError``).
+    Plain strings, not keyed by view: a single poll tick can only ever
+    belong to the view currently being downloaded, so the message names the
+    view and path together. Empty on every normal run.
     """
 
     run_directory: Path
     manifest_path: Path
     manifest: CollectionManifest
     view_errors: dict[WordstatView, str] = Field(default_factory=dict)
+    escaped_download_warnings: list[str] = Field(default_factory=list)
 
 
 class PhraseFailure(BaseModel):
