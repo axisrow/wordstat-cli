@@ -254,7 +254,7 @@ class WordstatCollector:
 
         exports = []
         for view, selector in VIEW_SELECTORS.items():
-            await self._select_view(page, selector)
+            await self._select_view(page, selector, view)
             source = await self._download_current_view(page, session, downloads_path)
             try:
                 # Convert before disposing of the download, so a parse or
@@ -398,17 +398,87 @@ class WordstatCollector:
             " && button.offsetParent !== null && getComputedStyle(button).visibility !== 'hidden')",
         )
 
-    async def _select_view(self, page, selector: str) -> None:
-        await self._click(page, selector)
-        # The download button appears as soon as the tab switches, before the
-        # table has actually loaded its rows; downloading at that point
-        # produces a header-only CSV. Wait for at least one data row too.
-        await self._wait_for(
-            page,
-            f"() => Boolean(document.querySelector({json.dumps(DOWNLOAD_SELECTOR)}))"
-            f" && document.querySelectorAll({json.dumps(TABLE_ROW_SELECTOR)}).length > 0",
+    async def _select_view(self, page, selector: str, view: WordstatView) -> None:
+        # The download button can remain in the DOM while Wordstat is
+        # switching views. The radio input is the actual active view marker
+        # (checked on the live page). Retry the click once if the marker
+        # does not become active before the normal wait timeout.
+        #
+        # The radio flipping to checked does not mean the table has
+        # repainted yet: for the three table-based views, the download
+        # button and an active marker can both be true while the DOM still
+        # shows the *previous* view's rows (or none), so downloading right
+        # then silently produces a header-only CSV (row_count: 0 — see
+        # issue #3 and the known-issue note in CLAUDE.md). REGIONS (the
+        # map) has no table rows at all, so it is exempt from this extra
+        # gate — requiring row presence there would hang forever.
+        #
+        # Row *presence* alone doesn't prove the rows are the new view's,
+        # not stale leftovers from the previous one — the same ambiguity
+        # `_collect_one` already handles for phrase switches via a table
+        # snapshot. A first pass at this (see PR #7 history) snapshotted
+        # the table unconditionally and required it change after the click
+        # — but the view loop always starts with TOP_POPULAR, and Wordstat
+        # is normally already showing that exact view right after a search,
+        # so clicking its own already-active tab has no reason to change
+        # the table at all: the gate was unconditionally unsatisfiable on
+        # the very first view of every phrase (found in review, round 2).
+        #
+        # Fix: read whether the target tab is ALREADY checked before
+        # clicking. If so, Wordstat isn't switching views at all — the
+        # click is a same-view no-op — so only the plain checked+download
+        # (+rows for table views) predicate applies, with no content-delta
+        # requirement. Only when the target tab is genuinely inactive
+        # before the click do we snapshot the table and require its content
+        # to differ, because that is the only case where "did the view
+        # actually repaint" is a real question.
+        was_already_active = view != WordstatView.REGIONS and await self._is_view_active(page, selector)
+        previous_table = (
+            await self._table_snapshot(page) if view != WordstatView.REGIONS and not was_already_active else None
         )
-        await asyncio.sleep(0.5)
+        target_selector = json.dumps(selector)
+        ready_expression = f"""() => {{
+            const label = document.querySelector({target_selector});
+            const input = label?.querySelector('input')
+                ?? (label?.htmlFor ? document.getElementById(label.htmlFor) : null);
+            return Boolean(input?.checked)
+                && Boolean(document.querySelector({json.dumps(DOWNLOAD_SELECTOR)}))"""
+        if view != WordstatView.REGIONS:
+            ready_expression += (
+                f"\n                && document.querySelectorAll({json.dumps(TABLE_ROW_SELECTOR)}).length > 0"
+            )
+            if not was_already_active:
+                ready_expression += (
+                    f"\n                && document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.textContent"
+                    f" !== {json.dumps(previous_table)};"
+                )
+            else:
+                ready_expression += ";"
+        else:
+            ready_expression += ";"
+        ready_expression += "\n        }"
+        # Two attempts must not cost double the configured timeout budget
+        # (issue found in review): split it so the worst case across both
+        # attempts still matches self.timeout_seconds, not 2x it.
+        attempt_seconds = self.timeout_seconds / 2
+        for attempt in range(2):
+            await self._click(page, selector)
+            try:
+                await self._wait_for(page, ready_expression, seconds=attempt_seconds)
+                return
+            except InterfaceChangedError:
+                if attempt == 1:
+                    raise
+
+    async def _is_view_active(self, page, selector: str) -> bool:
+        target_selector = json.dumps(selector)
+        result = await page.evaluate(f"""() => {{
+            const label = document.querySelector({target_selector});
+            const input = label?.querySelector('input')
+                ?? (label?.htmlFor ? document.getElementById(label.htmlFor) : null);
+            return Boolean(input?.checked);
+        }}""")
+        return bool(result)
 
     async def _table_snapshot(self, page) -> str | None:
         return await page.evaluate(
