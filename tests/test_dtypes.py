@@ -28,7 +28,8 @@ def test_parse_number_accepts_wordstat_number_formats(value, expected):
 @pytest.mark.parametrize(
     "value",
     [
-        "01.2024",  # dynamics period, must never become 1.2024
+        "август 2024",  # monthly dynamics period must remain text
+        "22.06.2026",  # daily/weekly dynamics date must remain text
         "1e5",
         "1_000",
         "inf",
@@ -45,7 +46,8 @@ def test_parse_number_rejects_non_numbers(value):
 
 
 def test_dynamics_period_column_stays_string():
-    assert infer_column(["01.2024", "02.2024", "03.2024"]) is None
+    assert infer_column(["август 2024", "сентябрь 2024", "октябрь 2024"]) is None
+    assert infer_column(["22.06.2026", "23.06.2026"]) is None
 
 
 def test_all_numeric_column_becomes_int64():

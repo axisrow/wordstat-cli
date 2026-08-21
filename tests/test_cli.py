@@ -142,6 +142,18 @@ def test_phrases_file_falls_back_to_cp1251(tmp_path: Path):
     assert resolve_phrases((), phrases_file) == ["чай", "кофе"]
 
 
+def test_phrases_file_with_a_utf8_bom_does_not_leak_into_the_first_phrase(tmp_path: Path):
+    # A BOM'd UTF-8 file decodes successfully under plain "utf-8" with the
+    # BOM character left attached to the first line; '﻿'.isspace() is
+    # False, so neither resolve_phrases' line.strip() nor the collector's
+    # own phrase.strip() removes it. utf-8-sig must be tried before plain
+    # utf-8 so the BOM is stripped during decoding itself.
+    phrases_file = tmp_path / "phrases.txt"
+    phrases_file.write_bytes("ремонт квартир\nдизайн интерьера\n".encode("utf-8-sig"))
+
+    assert resolve_phrases((), phrases_file) == ["ремонт квартир", "дизайн интерьера"]
+
+
 def test_phrases_file_with_undecodable_bytes_is_reported_without_a_traceback(tmp_path: Path):
     # 0x98 is invalid in both utf-8 (a lone continuation byte) and cp1251
     # (unassigned in that codepage) — one of the few byte values neither

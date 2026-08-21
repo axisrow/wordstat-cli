@@ -8,15 +8,22 @@ import click
 from wordstat.collector import WordstatCollector
 from wordstat.config import load_config
 from wordstat.errors import WordstatError
+from wordstat.periods import Granularity, parse_date, validate_period
 from wordstat.storage import prepare_resume_directory
 
 _CONFIG = load_config()
 _DEFAULT_CDP_URL = _CONFIG.get("cdp_url", "http://127.0.0.1:9222")
-# Wordstat's native export encoding is cp1251; a phrases file typed or saved
-# on the same machine can plausibly be in either. Mirrors the encoding probe
-# in csv_io.py, minus utf-8-sig (a phrases file is authored by hand, not
-# exported by Wordstat, so a BOM is unlikely but harmless either way).
-_PHRASES_FILE_ENCODINGS = ("utf-8", "cp1251")
+# Wordstat exports CSV as UTF-8 with BOM; a phrases file typed or saved
+# on the same machine can plausibly be in either, and utf-8-sig must come
+# before plain utf-8: a BOM'd file decodes successfully under plain
+# "utf-8" too, but leaves "﻿" attached to the first line. Neither
+# resolve_phrases' line.strip() nor the collector's own phrase.strip()
+# removes it ('﻿'.isspace() is False), so a BOM left in is not
+# harmless — it silently prepends an invisible character to the first
+# phrase, which then propagates into the typed Wordstat search, the
+# run-directory slug, and manifest.json. Mirrors the encoding probe in
+# csv_io.py.
+_PHRASES_FILE_ENCODINGS = ("utf-8-sig", "cp1251")
 
 
 @click.group()
@@ -70,6 +77,14 @@ def _read_phrases_file(path: Path) -> str:
 @click.option("--cdp-url", envvar="WORDSTAT_CDP_URL", default=_DEFAULT_CDP_URL, show_default=True)
 @click.option("--timeout", "timeout_seconds", type=click.FloatRange(min=1), default=45.0, show_default=True)
 @click.option(
+    "--granularity",
+    type=click.Choice(Granularity, case_sensitive=False),
+    default=Granularity.MONTHLY,
+    show_default=True,
+)
+@click.option("--date-from", type=str, default=None, help="Dynamics window start (YYYY-MM-DD).")
+@click.option("--date-to", type=str, default=None, help="Dynamics window end (YYYY-MM-DD).")
+@click.option(
     "--keep-raw",
     is_flag=True,
     default=False,
@@ -95,6 +110,9 @@ def collect(
     output_dir: Path,
     cdp_url: str,
     timeout_seconds: float,
+    granularity: str,
+    date_from: str | None,
+    date_to: str | None,
     keep_raw: bool,
     resume_dir: Path | None,
 ) -> None:
@@ -106,6 +124,13 @@ def collect(
     """
 
     phrases = resolve_phrases(phrase, phrases_file)
+    selected_granularity = Granularity(granularity.lower())
+    try:
+        parsed_from = parse_date(date_from)
+        parsed_to = parse_date(date_to)
+        validate_period(selected_granularity, parsed_from, parsed_to)
+    except WordstatError as error:
+        raise click.ClickException(str(error)) from error
     if not phrases:
         raise click.ClickException("At least one search phrase is required")
     if resume_dir is not None:
@@ -130,7 +155,14 @@ def collect(
         keep_raw=keep_raw,
     )
     try:
-        batch = asyncio.run(collector.collect_many(phrases, region=region, resume_directory=resume_dir))
+        collect_kwargs = {"region": region, "resume_directory": resume_dir}
+        if selected_granularity is not Granularity.MONTHLY or parsed_from is not None:
+            collect_kwargs.update(
+                granularity=selected_granularity,
+                date_from=parsed_from,
+                date_to=parsed_to,
+            )
+        batch = asyncio.run(collector.collect_many(phrases, **collect_kwargs))
     # Only domain errors become friendly messages; an unexpected ValueError
     # from a dependency should keep its traceback instead of being reworded.
     except WordstatError as error:

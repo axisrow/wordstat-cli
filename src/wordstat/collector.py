@@ -2,10 +2,11 @@
 
 import asyncio
 import json
+import re
 import tempfile
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from browser_use.browser import BrowserSession
@@ -28,6 +29,7 @@ from wordstat.models import (
     PhraseFailure,
     WordstatView,
 )
+from wordstat.periods import Granularity, validate_period
 from wordstat.storage import (
     create_run_directory,
     finalize_raw,
@@ -42,6 +44,8 @@ QUERY_SELECTOR = 'input[placeholder="Введите слово или слово
 SEARCH_SELECTOR = ".wordstat__search-button"
 DOWNLOAD_SELECTOR = "button.save-button"
 DOWNLOAD_CSV_MENU_ITEM_SELECTOR = "a[download]:has(button.save-csv-button)"
+GRANULARITY_SELECTOR = ".wordstat__content-type_select > button"
+DATE_RANGE_SELECTOR = ".range-datepicker__selected-dates > button"
 REGION_BUTTON_SELECTOR = ".settings__selected button"
 TABLE_ROW_SELECTOR = ".table__wrapper tbody tr"
 # Tab selectors live here with the rest of the DOM knowledge; the markup is
@@ -52,6 +56,19 @@ VIEW_SELECTORS = {
     WordstatView.DYNAMICS: "label[for='graph']",
     WordstatView.REGIONS: "label[for='map']",
 }
+# The live interface is Russian; map explicitly rather than depending on the
+# host locale. Shared by every place that needs a Russian month name (the
+# calendar popups and the applied-period wait below), so there is exactly
+# one list to keep in sync with the live UI's wording. Nominative form —
+# what the calendar popups' option labels use ("январь", "декабрь").
+RUSSIAN_MONTHS = "январь февраль март апрель май июнь июль август сентябрь октябрь ноябрь декабрь".split()
+# Genitive form — what the dynamics table's first cell uses for daily/weekly
+# rows ("22 июня", "24 декабря 2018": "of June", "of December"). Confirmed
+# live (issue #6 phase 1/2 documents) that this differs from RUSSIAN_MONTHS;
+# a fixed nominative-month match against this genitive text never matches.
+RUSSIAN_MONTHS_GENITIVE = (
+    "января февраля марта апреля мая июня июля августа сентября октября ноября декабря".split()
+)
 
 
 def _is_untrustworthy_empty_export(view: WordstatView, dataset: CsvDataset) -> bool:
@@ -120,11 +137,44 @@ class WordstatCollector:
         output_root: Path,
         timeout_seconds: float = 45.0,
         keep_raw: bool = False,
+        settling_seconds: float = 1.0,
+        empty_export_retry_seconds: float = 2.0,
     ) -> None:
         self.cdp_url = cdp_url
         self.output_root = output_root
         self.timeout_seconds = timeout_seconds
         self.keep_raw = keep_raw
+        # Both are real, unconditional pauses against the live UI (see their
+        # call sites in _collect_one) — not upper-bound timeouts like
+        # timeout_seconds, which _wait_for polls against a condition and
+        # returns early. Kept as constructor parameters (not hardcoded) so
+        # tests against a fake, instantly-responding page can set them to 0
+        # instead of actually blocking the test process for real wall-clock
+        # time on every view of every phrase (140 tests went from 26.9s to
+        # 0.77s once collect_many's own tests did this — see git history).
+        #
+        # settling_seconds (introduced in efaa9ba, issue #6 phase 2): a
+        # preventive pause before downloading each non-map view, guarding
+        # against a header-only CSV race first observed for issue #11
+        # (Wordstat can return a checked radio + enabled download button
+        # before the export blob has actually been rebuilt for the newly
+        # selected phrase/view). No one has reproduced *this specific*
+        # settling race with reliable repro steps — the 1.0s value was
+        # chosen without a live timing measurement, not derived from one.
+        # Cost: +1s per non-map view, +3s per phrase (3 of 4 views are
+        # non-map), so +50s across a 50-phrase batch. Do not remove without
+        # a way to verify nothing regresses — issue #22 currently blocks a
+        # full CLI run from reaching DYNAMICS at all (see collector.py's
+        # fail-closed behavior on empty top exports), so there is no cheap
+        # end-to-end signal today that would catch a regression from
+        # removing this.
+        #
+        # empty_export_retry_seconds: unlike the above, this one does have
+        # a concrete, structural trigger — it only fires after
+        # _is_untrustworthy_empty_export has already caught a table-visible-
+        # but-CSV-empty export on this specific run, not preventively.
+        self.settling_seconds = settling_seconds
+        self.empty_export_retry_seconds = empty_export_retry_seconds
         self._previous_table_snapshot: str | None = None
 
     async def collect(
@@ -148,6 +198,9 @@ class WordstatCollector:
         phrases: list[str],
         region: str = "Россия",
         resume_directory: Path | None = None,
+        granularity: Granularity = Granularity.MONTHLY,
+        date_from: date | None = None,
+        date_to: date | None = None,
     ) -> BatchCollectionResult:
         """Collect reports for several phrases inside a single browser session.
 
@@ -165,6 +218,7 @@ class WordstatCollector:
         """
 
         region = region.strip()
+        validate_period(granularity, date_from, date_to)
         if not phrases:
             raise InvalidRequestError("At least one search phrase is required")
         if not region:
@@ -233,15 +287,22 @@ class WordstatCollector:
                         # _collect_one for why the region control can't be
                         # re-selected once a phrase's view loop has run (and
                         # doesn't need to be after that).
+                        collect_kwargs = {
+                            "set_region": not region_ready,
+                            "on_region_applied": _mark_region_ready,
+                            "resume_directory": resume_directory,
+                        }
+                        # Keep the historical call shape for the default
+                        # monthly path; several integrations monkeypatch this
+                        # seam and default behavior must remain unchanged.
+                        if granularity is not Granularity.MONTHLY or date_from is not None:
+                            collect_kwargs.update(
+                                granularity=granularity,
+                                date_from=date_from,
+                                date_to=date_to,
+                            )
                         result = await self._collect_one(
-                            page,
-                            session,
-                            downloads_path,
-                            phrase,
-                            region,
-                            set_region=not region_ready,
-                            on_region_applied=_mark_region_ready,
-                            resume_directory=resume_directory,
+                            page, session, downloads_path, phrase, region, **collect_kwargs
                         )
                         results.append(result)
                     except AuthenticationRequiredError as error:
@@ -279,6 +340,9 @@ class WordstatCollector:
         set_region: bool = True,
         on_region_applied: Callable[[], None] | None = None,
         resume_directory: Path | None = None,
+        granularity: Granularity = Granularity.MONTHLY,
+        date_from: date | None = None,
+        date_to: date | None = None,
     ) -> CollectionResult:
         # Checked once before the batch starts (collect_many), but a session
         # can lose authentication mid-batch (e.g. Yandex logs it out); check
@@ -295,6 +359,11 @@ class WordstatCollector:
             # separate, explicit path, not a fallback baked into it.
             run_directory = resume_directory
             manifest = prepare_resume_directory(run_directory, phrase, region)
+            requested_period = self._requested_period(date_from, date_to)
+            if manifest.granularity is not granularity or manifest.requested_period != requested_period:
+                raise InvalidRequestError(
+                    "--resume-dir was created with a different dynamics granularity or requested period"
+                )
             manifest_path = run_directory / "manifest.json"
             pending_views = views_to_collect(run_directory, manifest)
             if not pending_views:
@@ -359,6 +428,8 @@ class WordstatCollector:
                 updated_at=start,
                 source_url=await page.get_url(),
                 exports=[],
+                granularity=granularity,
+                requested_period=self._requested_period(date_from, date_to),
             )
             write_manifest(manifest_path, manifest)
         else:
@@ -378,17 +449,44 @@ class WordstatCollector:
         for view in pending_views:
             selector = VIEW_SELECTORS[view]
             await self._select_view(page, selector, view)
+            # The live UI can expose the first table row before the export
+            # blob has been rebuilt for the selected phrase/view. A short
+            # settling interval prevents a header-only CSV from racing the
+            # table repaint; the structural row gate above remains required.
+            if view is not WordstatView.REGIONS and self.settling_seconds > 0:
+                await asyncio.sleep(self.settling_seconds)
+            if view is WordstatView.DYNAMICS and (
+                granularity is not Granularity.MONTHLY or date_from is not None
+            ):
+                await self._set_granularity(page, granularity)
+                if date_from is not None:
+                    await self._set_period(page, granularity, date_from, date_to)
             source = await self._download_current_view(page, session, downloads_path)
             try:
                 # Convert before disposing of the download, so a parse or
-                # write failure leaves the raw CSV on disk to inspect.
+                # write failure leaves the raw CSV on disk to inspect. The
+                # live export blob can lag the table repaint once; retry an
+                # empty table export once before failing closed.
                 dataset = parse_wordstat_csv(source, view)
                 if _is_untrustworthy_empty_export(view, dataset):
+                    if self.empty_export_retry_seconds > 0:
+                        await asyncio.sleep(self.empty_export_retry_seconds)
+                    source = await self._download_current_view(page, session, downloads_path)
+                    dataset = parse_wordstat_csv(source, view)
+                if _is_untrustworthy_empty_export(view, dataset):
                     raise InterfaceChangedError(
-                        f"Wordstat returned an empty {view.value} CSV, but the page had rendered at "
-                        "least one table row before the download was triggered; export is not trustworthy"
+                        f"Wordstat returned an empty {view.value} CSV after a retry, but the page had rendered "
+                        "at least one table row before the download was triggered; export is not trustworthy"
                     )
-                data_path, dtypes = write_dataset(dataset, run_directory)
+                if view is WordstatView.DYNAMICS:
+                    self._assert_contiguous_dynamics_rows(
+                        dataset, granularity, date_from=date_from, date_to=date_to
+                    )
+                file_name = self._dynamics_file_name(granularity) if view is WordstatView.DYNAMICS else None
+                if file_name is None:
+                    data_path, dtypes = write_dataset(dataset, run_directory)
+                else:
+                    data_path, dtypes = write_dataset(dataset, run_directory, file_name=file_name)
                 raw_path = finalize_raw(source, run_directory, view, self.keep_raw)
             except Exception:  # noqa: BLE001
                 # source lives in the batch's shared, temporary downloads
@@ -416,6 +514,10 @@ class WordstatCollector:
             # CollectionManifest.status), not a stale one still claiming
             # every view is missing.
             manifest = merge_export(manifest, export)
+            if view is WordstatView.DYNAMICS:
+                manifest = manifest.model_copy(
+                    update={"actual_period": self._actual_period(dataset)}
+                )
             write_manifest(manifest_path, manifest)
 
         return CollectionResult(
@@ -423,6 +525,311 @@ class WordstatCollector:
             manifest_path=manifest_path,
             manifest=manifest,
         )
+
+    @staticmethod
+    def _requested_period(date_from: date | None, date_to: date | None) -> dict[str, str] | None:
+        if date_from is None or date_to is None:
+            return None
+        return {"from": date_from.isoformat(), "to": date_to.isoformat()}
+
+    @staticmethod
+    def _actual_period(dataset: CsvDataset) -> dict[str, str] | None:
+        if not dataset.rows or not dataset.headers:
+            return None
+        field = dataset.headers[0]
+        return {"field": field, "from": dataset.rows[0][field], "to": dataset.rows[-1][field]}
+
+    @staticmethod
+    def _assert_contiguous_dynamics_rows(
+        dataset: CsvDataset,
+        granularity: Granularity,
+        date_from: date | None = None,
+        date_to: date | None = None,
+    ) -> None:
+        # This parses dataset.rows[field] — the exported CSV's date column
+        # — with strptime("%d.%m.%Y"), NOT the DOM's displayed cell text.
+        # Live-measured weekly CSV (issue #6 phase 1 document — see
+        # `docs/ISSUE6_PHASE1_RESEARCH.md` on the PR #20 branch,
+        # `git show 4be8996:docs/ISSUE6_PHASE1_RESEARCH.md`): the exported
+        # field is named "Неделя с" and holds only the week's start date
+        # as a bare DD.MM.YYYY value ("22.06.2026") — no range, no week
+        # number — confirmed byte-for-byte from a real downloaded CSV. The
+        # DOM cell (_wait_for_table_granularity's WEEKLY pattern below)
+        # shows a genitive-month date *range* instead ("22 июня 2026 – 28
+        # июня 2026"); that is a different string in a different place and
+        # does not describe the exported column. Do not "fix" this parse
+        # to expect a range based on the DOM pattern — that would break a
+        # confirmed-working live path (cycle-review round 1's R2 and round
+        # 2's RR1 both raised this same claim from reading the code
+        # without this doc open; both were false positives).
+        #
+        # Monthly's period field is a nominative Russian month name
+        # ("август 2024", confirmed live — issue #6 phase 1 document), not
+        # a strptime("%d.%m.%Y")-parseable date the way daily/weekly are,
+        # so neither contiguity nor containment can be validated here for
+        # it; _wait_for_period_applied still gates monthly's start
+        # boundary before download (same mechanism as daily/weekly), and
+        # _actual_period records the raw field/from/to strings into the
+        # manifest for every dynamics export including monthly, so actual
+        # coverage stays observable post-hoc even without this check
+        # (cycle-review round 2, C2 triage).
+        if granularity is Granularity.MONTHLY or not dataset.rows:
+            return
+        field = dataset.headers[0]
+        try:
+            dates = [datetime.strptime(row[field], "%d.%m.%Y").date() for row in dataset.rows]
+        except ValueError as error:
+            raise InterfaceChangedError(
+                f"Wordstat returned an unexpected {granularity.value} dynamics date format"
+            ) from error
+        if len(dates) >= 2:
+            step = timedelta(days=1 if granularity is Granularity.DAILY else 7)
+            for previous, current in zip(dates, dates[1:]):
+                if current - previous != step:
+                    raise InterfaceChangedError(
+                        f"Wordstat returned a gap in the {granularity.value} dynamics series "
+                        f"between {previous:%d.%m.%Y} and {current:%d.%m.%Y}"
+                    )
+        # Containment, not equality: a shorter export fully inside the
+        # requested window is legitimate (the daily series' variable
+        # trailing tail, confirmed live — issue #6 phase 1 document), so
+        # this never compares dates[0]/dates[-1] against date_from/date_to
+        # for exact equality. What it does reject is a row *outside* the
+        # requested window in either direction — the live race this guards
+        # against (collector.py:603, _wait_for_period_applied) confirms
+        # only the first cell's format+value match date_from before
+        # downloading; it has no equivalent check for date_to, so a table
+        # that has not yet repainted past a previous, stale window can
+        # download and be recorded as complete with data that never
+        # entered the requested window at all. Deliberately runs even for
+        # a single-row export (needs only dates[0]/dates[-1], which are
+        # the same row — unlike the pairwise contiguity loop above, which
+        # needs at least two rows): a single stale/truncated row is not
+        # exempt just because it is too short to check contiguity
+        # (cycle-review round 2, C2 triage — the original version gated
+        # this behind the same `len(rows) < 2` early return as contiguity
+        # and let a 1-row export bypass it entirely). Only applies when an
+        # explicit period was requested (date_from/date_to are None for
+        # the UI's default window, which this function cannot validate
+        # against any specific boundary).
+        if date_from is not None and date_to is not None:
+            # Weekly rows are keyed by the Monday of date_from's week, not
+            # date_from itself (confirmed live — _wait_for_period_applied's
+            # own comment above), so the lower bound must be that aligned
+            # Monday, not the raw requested date, or a legitimate alignment
+            # would be misreported as a stale window.
+            lower_bound = (
+                date_from - timedelta(days=date_from.weekday())
+                if granularity is Granularity.WEEKLY
+                else date_from
+            )
+            if dates[0] < lower_bound:
+                raise InterfaceChangedError(
+                    f"Wordstat {granularity.value} dynamics export starts at {dates[0]:%d.%m.%Y}, "
+                    f"before the requested window start {lower_bound:%d.%m.%Y}"
+                )
+            if dates[-1] > date_to:
+                raise InterfaceChangedError(
+                    f"Wordstat {granularity.value} dynamics export ends at {dates[-1]:%d.%m.%Y}, "
+                    f"after the requested window end {date_to:%d.%m.%Y}"
+                )
+
+
+    @staticmethod
+    def _dynamics_file_name(granularity: Granularity) -> str:
+        # Preserve the old monthly filename for existing consumers; non-monthly
+        # exports must carry their granularity in the filename.
+        return "dynamics.parquet" if granularity is Granularity.MONTHLY else f"dynamics_{granularity.value}.parquet"
+
+    async def _set_granularity(self, page, granularity: Granularity) -> None:
+        labels = {
+            Granularity.DAILY: "По дням",
+            Granularity.WEEKLY: "По неделям",
+            Granularity.MONTHLY: "По месяцам",
+        }
+        await self._click(page, GRANULARITY_SELECTOR)
+        await self._click_visible_text(page, ".Popup2_visible [role='option']", labels[granularity])
+        await self._wait_for(
+            page,
+            f"() => document.querySelector({json.dumps(GRANULARITY_SELECTOR)})?.textContent?.trim() === "
+            f"{json.dumps(labels[granularity])}",
+        )
+        await self._wait_for_table_granularity(page, granularity)
+
+    async def _set_period(self, page, granularity: Granularity, date_from: date, date_to: date | None) -> None:
+        if date_to is None:
+            raise InvalidRequestError("A period end date is required when a start date is provided")
+        popup_type = "month" if granularity is Granularity.MONTHLY else (
+            "week" if granularity is Granularity.WEEKLY else "day"
+        )
+        await self._click(page, DATE_RANGE_SELECTOR)
+        await self._select_calendar_date(page, popup_type, date_from)
+        if popup_type != "month":
+            # day/week: independent popups per click, live-confirmed by
+            # 255bca7's daily/weekly runs going through this exact
+            # two-click path successfully.
+            await self._click(page, DATE_RANGE_SELECTOR)
+        else:
+            # month: a single shared range-picker, not two independent
+            # popups (live CDP check, issue #6 phase 2, cycle-review
+            # round 2). Right after date_from is picked, every month
+            # element already carries the "in-selecting-range" class —
+            # the picker is already in range-selection mode — and the
+            # date-range button's text does not update to reflect
+            # date_from yet; it only updates once date_to is picked in
+            # the SAME still-open popup. A second DATE_RANGE_SELECTOR
+            # click here closes this popup instead of reopening it
+            # (confirmed live: visibility flips to 'hidden'), so the
+            # follow-up _select_calendar_date for date_to would time out
+            # waiting for a popup that never reappears. Confirmed live
+            # that skipping the intermediate click and picking date_to
+            # directly in the still-open popup produces the correct
+            # button text "Январь 2024 — Июнь 2024".
+            pass
+        await self._select_calendar_date(page, popup_type, date_to)
+        # _wait_for_table_granularity alone is not enough here: it only
+        # checks that the first cell's *format* matches the granularity
+        # (e.g. "looks like a week range"), which is already true of the
+        # table's pre-existing content before the period change has been
+        # applied. Live CDP checks (issue #6 phase 2) caught this exact
+        # race: the date-range button already showed the newly picked
+        # dates, _wait_for_table_granularity's format check passed
+        # immediately, and the exported CSV still carried Wordstat's
+        # default window — the table's *values* had not caught up yet.
+        # Waiting for the first cell to actually start at the expected
+        # date closes that gap, and turns a silent wrong-period export
+        # into a loud InterfaceChangedError if the picker never catches up.
+        #
+        # This only confirms the *start* boundary (date_from), because it
+        # runs before the download and only the first row is visible/known
+        # at this point. It does not by itself prove the *end* boundary
+        # (date_to) has also repainted — a table that has advanced its
+        # first row but not yet its last row would pass this wait and
+        # still download a stale end. The end boundary is guarded
+        # separately, after the download, by
+        # _assert_contiguous_dynamics_rows' containment check against the
+        # actually-exported rows (confirmed as a real gap during review,
+        # not just theory) — that is the authoritative defense for
+        # date_to, not an earlier DOM-state wait for it.
+        await self._wait_for_period_applied(page, granularity, date_from)
+
+    async def _wait_for_period_applied(self, page, granularity: Granularity, date_from: date) -> None:
+        # The month name in the first cell is genitive ("22 июня", "24
+        # декабря" — day-of/week-of a date) for daily/weekly, but
+        # nominative ("август 2024") for monthly (confirmed live, issue #6
+        # phase 1/2 documents) — hence two separate month lists rather than
+        # one. Matching the exact expected month (not just "any month word")
+        # matters: without it, "24 <any month> 2018" would silently accept
+        # a wrong month picked by a stuck calendar, defeating the point of
+        # this wait (confirmed as a real gap during review, not just theory).
+        if granularity is Granularity.MONTHLY:
+            expected = f"{RUSSIAN_MONTHS[date_from.month - 1]} {date_from.year}"
+        elif granularity is Granularity.DAILY:
+            expected = f"{date_from.day} {RUSSIAN_MONTHS_GENITIVE[date_from.month - 1]}"
+        else:
+            # Weekly's first cell is the Monday of date_from's week, not
+            # date_from itself (confirmed live: 2018-12-26, a Wednesday,
+            # produced a first cell starting "24 декабря" — the preceding
+            # Monday). Wordstat does this alignment itself; not a bug.
+            week_start = date_from - timedelta(days=date_from.weekday())
+            expected = f"{week_start.day} {RUSSIAN_MONTHS_GENITIVE[week_start.month - 1]} {week_start.year}"
+        pattern = "^" + re.escape(expected)
+        await self._wait_for(
+            page,
+            f"() => new RegExp({json.dumps(pattern)}).test("
+            f"document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.querySelector('td')"
+            "?.textContent?.trim() ?? '')",
+        )
+
+    async def _wait_for_table_granularity(self, page, granularity: Granularity) -> None:
+        patterns = {
+            Granularity.DAILY: r"^\d{1,2}\s+[А-Яа-яЁё]+$",
+            Granularity.WEEKLY: r"^\d{1,2}\s+[А-Яа-яЁё]+\s+\d{4}\s+–\s+\d{1,2}\s+[А-Яа-яЁё]+\s+\d{4}$",
+            Granularity.MONTHLY: r"^[А-Яа-яЁё]+\s+\d{4}$",
+        }
+        expression = (
+            "() => new RegExp(" + json.dumps(patterns[granularity]) + ").test(" 
+            f"document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.querySelector('td')?.textContent?.trim() ?? '')"
+        )
+        await self._wait_for(page, expression)
+
+    async def _select_calendar_date(self, page, popup_type: str, target: date) -> None:
+        root = f".range-datepicker_type_{popup_type}"
+        await self._wait_for(
+            page,
+            f"() => [...document.querySelectorAll({json.dumps(root)})].some((x) => "
+            "x.offsetParent !== null && getComputedStyle(x).visibility !== 'hidden')",
+        )
+        month_label = RUSSIAN_MONTHS[target.month - 1]
+        if popup_type == "month":
+            year_selector = f"{root} .datepicker-month__years_select > button"
+            month_selector = f"{root} .react-datepicker__month-text"
+        else:
+            year_selector = f"{root} .range-datepicker__years_select > button"
+            month_selector = f"{root} .range-datepicker__months_select > button"
+        await self._click(page, year_selector)
+        await self._click_visible_text(page, ".Popup2_visible [role='option']", str(target.year))
+        if popup_type in {"day", "week"}:
+            await self._click(page, month_selector)
+            await self._click_visible_text(page, ".Popup2_visible [role='option']", month_label)
+        day_selector = f"{root} button[name='day']"
+        if popup_type == "month":
+            # Live CDP check (issue #6 phase 2, cycle-review round 2): the
+            # month-text popup renders lowercase nominative month names
+            # ("январь"), matching RUSSIAN_MONTHS verbatim.
+            # month_label.capitalize() ("Январь") never matches any of
+            # them — every explicit monthly request with
+            # --date-from/--date-to failed here with InterfaceChangedError
+            # ("Wordstat option 'Январь' was not uniquely found") despite
+            # validate_period accepting the request and the browser
+            # already being driven. Do not re-add .capitalize(): it was
+            # never confirmed live and is contradicted by the confirmed
+            # live DOM text.
+            await self._click_visible_text(page, month_selector, month_label)
+        else:
+            await self._click_visible_date_button(page, day_selector, str(target.day))
+
+    async def _click_visible_date_button(self, page, selector: str, text: str) -> None:
+        result = await page.evaluate(
+            """(...args) => {
+                const [selector, text] = args;
+                const matches = [...document.querySelectorAll(selector)].filter((element) => {
+                    const style = getComputedStyle(element);
+                    return element.textContent?.trim() === text
+                        && !element.className.toString().includes('outside')
+                        && !element.className.toString().includes('disabled')
+                        && element.offsetParent !== null
+                        && style.visibility !== 'hidden';
+                });
+                if (matches.length !== 1) return JSON.stringify({count: matches.length});
+                matches[0].click();
+                return JSON.stringify({count: 1});
+            }""",
+            selector,
+            text,
+        )
+        if json.loads(result) != {"count": 1}:
+            raise InterfaceChangedError(f"Wordstat date control {selector!r} was not uniquely found")
+
+    async def _click_visible_text(self, page, selector: str, text: str) -> None:
+        result = await page.evaluate(
+            """(...args) => {
+                const [selector, text] = args;
+                const matches = [...document.querySelectorAll(selector)].filter((element) => {
+                    const style = getComputedStyle(element);
+                    return element.textContent?.trim() === text
+                        && element.offsetParent !== null
+                        && style.visibility !== 'hidden';
+                });
+                if (matches.length !== 1) return JSON.stringify({count: matches.length});
+                matches[0].click();
+                return JSON.stringify({count: 1});
+            }""",
+            selector,
+            text,
+        )
+        if json.loads(result) != {"count": 1}:
+            raise InterfaceChangedError(f"Wordstat option {text!r} was not uniquely found")
 
     async def _assert_authenticated(self, page) -> None:
         state = await page.evaluate(
