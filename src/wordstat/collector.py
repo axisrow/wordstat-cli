@@ -301,12 +301,34 @@ class WordstatCollector:
             # derived as every view missing / "incomplete") so a crash before
             # the first view even finishes still leaves a manifest.json on
             # disk describing an empty-but-started run, instead of nothing.
+            # updated_at is set here too (equal to created_at for this first
+            # write): leaving it null would make null ambiguous between "a
+            # successful write already happened" and "this manifest predates
+            # the updated_at field" — see CollectionManifest's docstring,
+            # which promises null means only the latter.
+            start = datetime.now(UTC)
             manifest = CollectionManifest(
                 phrase=phrase,
                 region=region,
-                created_at=datetime.now(UTC),
+                created_at=start,
+                updated_at=start,
                 source_url=await page.get_url(),
                 exports=[],
+            )
+            write_manifest(manifest_path, manifest)
+        else:
+            # Resuming: source_url must not silently keep pointing at
+            # whatever tab/phrase the *previous* session ended on — it is
+            # only accurate as of the last successful write (see
+            # CollectionManifest's docstring), and this write is that.
+            # created_at is deliberately left untouched: it marks when this
+            # run started, not when every view was collected, and a resumed
+            # run's views can legitimately span more than one session.
+            # Doing this after _set_phrase (not before) is required: the
+            # page is still on the previous phrase/tab until _set_phrase
+            # returns.
+            manifest = manifest.model_copy(
+                update={"source_url": await page.get_url(), "updated_at": datetime.now(UTC)}
             )
             write_manifest(manifest_path, manifest)
 

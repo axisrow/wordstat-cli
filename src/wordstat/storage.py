@@ -67,6 +67,15 @@ def write_manifest(path: Path, manifest: CollectionManifest) -> None:
     not cosmetic: a bare ``tempfile`` call defaults to the system temp
     directory, and ``os.replace`` across filesystems raises ``OSError``
     instead of renaming atomically.
+
+    ``os.replace`` only guarantees the *ordering* of the rename, not that the
+    temporary file's bytes have actually reached disk — on a power loss or
+    kernel panic the rename can land while the data behind it is still only
+    in a page cache buffer, leaving an empty or garbage manifest.json where a
+    valid one used to be. ``flush()`` (drain Python's own buffer) followed by
+    ``os.fsync()`` (ask the OS to commit it to disk) before the ``replace``
+    closes that gap; the whole point of this file is surviving a crash
+    mid-run, so this one extra syscall is worth it.
     """
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -77,6 +86,8 @@ def write_manifest(path: Path, manifest: CollectionManifest) -> None:
             # pydantic emits UTF-8 without escaping non-ASCII, so the
             # Cyrillic stays readable without a round-trip through json.
             handle.write(manifest.model_dump_json(indent=2) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp_path, path)
     finally:
         # os.replace already moved the temp file away on the success path,
@@ -146,7 +157,9 @@ def views_to_collect(run_directory: Path, manifest: CollectionManifest) -> list[
     return [view for view in WordstatView if view not in done]
 
 
-def merge_export(manifest: CollectionManifest, export: ExportSummary) -> CollectionManifest:
+def merge_export(
+    manifest: CollectionManifest, export: ExportSummary, now: datetime | None = None
+) -> CollectionManifest:
     """Return a copy of ``manifest`` with one more view recorded.
 
     Keeps ``exports`` ordered by :class:`WordstatView` declaration order
@@ -155,10 +168,17 @@ def merge_export(manifest: CollectionManifest, export: ExportSummary) -> Collect
     fields derived straight from ``exports`` (see
     :class:`~wordstat.models.CollectionManifest`), so updating only
     ``exports`` here is enough to keep them correct — there is nothing else
-    to recompute.
+    to recompute for those two.
+
+    ``updated_at`` is bumped to ``now`` (defaulting to the current UTC time,
+    like :func:`create_run_directory` — a caller can pass a fixed value for
+    deterministic tests) on every call, since every call records a real
+    write to the manifest. This is a pure function, so it never reads the
+    clock unless the caller lets it: no hidden ``datetime.now()`` unless
+    ``now`` is left unset.
     """
 
     by_view = {item.view: item for item in manifest.exports}
     by_view[export.view] = export
     exports = [by_view[view] for view in WordstatView if view in by_view]
-    return manifest.model_copy(update={"exports": exports})
+    return manifest.model_copy(update={"exports": exports, "updated_at": now or datetime.now(UTC)})

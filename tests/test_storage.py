@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -340,3 +341,117 @@ def test_load_manifest_round_trips_what_write_manifest_wrote(tmp_path: Path) -> 
 def test_load_manifest_rejects_a_missing_file(tmp_path: Path) -> None:
     with pytest.raises(ResumeMismatchError, match="No manifest.json"):
         load_manifest(tmp_path / "manifest.json")
+
+
+# --- fsync before os.replace (write_manifest atomicity, cheri-pick #1) -----
+
+
+def test_write_manifest_fsyncs_before_replacing_the_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A test that only asserts fsync was *called* would also pass if fsync
+    # ran after os.replace, where it can no longer prevent a torn write.
+    # Record the actual order both land in.
+    path = tmp_path / "manifest.json"
+    order = []
+
+    real_fsync = os.fsync
+    real_replace = os.replace
+
+    def recording_fsync(fd):
+        order.append("fsync")
+        return real_fsync(fd)
+
+    def recording_replace(src, dst):
+        order.append("replace")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("wordstat.storage.os.fsync", recording_fsync)
+    monkeypatch.setattr("wordstat.storage.os.replace", recording_replace)
+
+    write_manifest(path, _manifest())
+
+    assert order == ["fsync", "replace"]
+
+
+# --- unique-view validator (cheri-pick #2) ---------------------------------
+
+
+def test_collection_manifest_rejects_duplicate_view_exports() -> None:
+    with pytest.raises(ValueError, match="duplicate view exports"):
+        CollectionManifest(
+            phrase="ремонт квартир",
+            region="Москва",
+            created_at=datetime(2026, 8, 20, 12, 0, tzinfo=UTC),
+            source_url="https://wordstat.yandex.ru/?words=test",
+            exports=[_export(WordstatView.DYNAMICS), _export(WordstatView.DYNAMICS)],
+        )
+
+
+def test_load_manifest_rejects_a_hand_edited_file_with_duplicate_views(tmp_path: Path) -> None:
+    # The threat this guards against is a corrupted/hand-edited file on
+    # disk, read back by a resume — not a constructor call in this
+    # codebase's own code (merge_export can't produce this). ValidationError
+    # is a ValueError subclass, so load_manifest's existing `except
+    # ValueError` must turn it into the same ResumeMismatchError a resuming
+    # caller already handles.
+    path = tmp_path / "manifest.json"
+    write_manifest(path, _manifest(exports=[_export(WordstatView.DYNAMICS)]))
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["exports"].append(dict(raw["exports"][0]))  # duplicate the one export
+    path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    with pytest.raises(ResumeMismatchError, match="not a valid Wordstat manifest"):
+        load_manifest(path)
+
+
+def test_merge_export_does_not_reintroduce_duplicate_views() -> None:
+    # merge_export replaces by view in a dict, so re-merging the same view
+    # must not somehow produce two entries — confirms the validator and the
+    # write path agree rather than one silently working around the other.
+    manifest = _manifest(exports=[_export(WordstatView.DYNAMICS)])
+
+    updated = merge_export(manifest, _export(WordstatView.DYNAMICS, file="dynamics-v2.parquet"))
+
+    assert [e.view for e in updated.exports] == [WordstatView.DYNAMICS]
+    assert updated.exports[0].file == "dynamics-v2.parquet"
+
+
+# --- updated_at optionality / round-trip (prerequisite for bugfix #3) ------
+
+
+def test_updated_at_defaults_to_none() -> None:
+    assert _manifest().updated_at is None
+
+
+def test_load_manifest_accepts_a_manifest_json_written_before_updated_at_existed(tmp_path: Path) -> None:
+    # A manifest.json on disk from an older version of this tool has no
+    # "updated_at" key at all. load_manifest must still validate it (as
+    # None), not reject an otherwise perfectly resumable directory.
+    path = tmp_path / "manifest.json"
+    payload = json.loads(_manifest(exports=[_export(WordstatView.TOP_POPULAR)]).model_dump_json())
+    del payload["updated_at"]
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    loaded = load_manifest(path)
+
+    assert loaded.updated_at is None
+
+
+# --- merge_export bumps updated_at (prerequisite for bugfix #3) ------------
+
+
+def test_merge_export_sets_updated_at_to_the_given_now() -> None:
+    now = datetime(2026, 8, 21, 9, 30, tzinfo=UTC)
+    manifest = _manifest(exports=[])
+
+    updated = merge_export(manifest, _export(WordstatView.TOP_POPULAR), now=now)
+
+    assert updated.updated_at == now
+
+
+def test_merge_export_does_not_touch_created_at() -> None:
+    manifest = _manifest(exports=[])
+    original_created_at = manifest.created_at
+
+    updated = merge_export(manifest, _export(WordstatView.TOP_POPULAR), now=datetime(2026, 8, 22, tzinfo=UTC))
+
+    assert updated.created_at == original_created_at

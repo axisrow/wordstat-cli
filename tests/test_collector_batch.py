@@ -34,11 +34,14 @@ def _fake_result(tmp_path, phrase) -> CollectionResult:
 
 
 class _FakePage:
+    def __init__(self, url: str = "https://wordstat.yandex.ru/?words=test"):
+        self.url = url
+
     async def goto(self, url):
         pass
 
     async def get_url(self):
-        return "https://wordstat.yandex.ru/?words=test"
+        return self.url
 
 
 class _FakeSession:
@@ -562,6 +565,12 @@ def test_collect_one_writes_the_manifest_after_every_view_not_only_at_the_end(mo
     on_disk = load_manifest(result.manifest_path)
     assert on_disk.status == "complete"
     assert len(on_disk.exports) == 4
+    # Even the very first write (before any view exists) must set
+    # updated_at, not leave it null — null is reserved for manifests written
+    # by a version of this tool that predates the field, and a fresh run
+    # must never look like one of those.
+    assert on_disk.updated_at is not None
+    assert on_disk.updated_at >= on_disk.created_at
 
 
 def test_collect_one_resume_directory_only_collects_missing_views(monkeypatch, tmp_path):
@@ -690,3 +699,123 @@ def test_collect_many_rejects_resume_directory_with_more_than_one_phrase(tmp_pat
 
     with pytest.raises(InvalidRequestError, match="--resume-dir requires exactly one phrase"):
         asyncio.run(collector.collect_many(["чай", "кофе"], resume_directory=resume_dir))
+
+
+# --- resume updates source_url/updated_at, leaves created_at alone (bugfix #3) ---
+
+
+def test_collect_one_resume_updates_source_url_and_updated_at_but_not_created_at(monkeypatch, tmp_path):
+    """The bug no reviewer caught: resuming used to leave created_at and
+    source_url exactly as they were after the first, interrupted pass, even
+    though the remaining views are collected later, from a different page
+    state. created_at must still describe when the run *started*; source_url
+    must reflect the page at the time of this write, not the first one."""
+
+    _patch_common(monkeypatch)
+
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector):
+        pass
+
+    async def failing_download(self, page, session, dl_path):
+        raise RuntimeError("simulated interruption before any view finished")
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", failing_download)
+
+    collector = WordstatCollector("cdp", tmp_path)
+
+    async def run_first():
+        page = _FakePage(url="https://wordstat.yandex.ru/?words=тест&region=Россия")
+        session = _FakeSession()
+        with pytest.raises(RuntimeError, match="simulated interruption"):
+            await collector._collect_one(page, session, downloads_path, "тест", "Россия")
+
+    asyncio.run(run_first())
+
+    run_directory = next(p for p in tmp_path.glob("runs/*") if p.is_dir())
+    first_manifest = load_manifest(run_directory / "manifest.json")
+    original_created_at = first_manifest.created_at
+    original_source_url = first_manifest.source_url
+    original_updated_at = first_manifest.updated_at
+
+    async def succeeding_download(self, page, session, dl_path):
+        source = dl_path / "export.csv"
+        _write_view_csv(source, "тест")
+        return source
+
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", succeeding_download)
+
+    resumed_url = "https://wordstat.yandex.ru/?words=тест&region=Россия&tab=table"
+
+    async def run_resume():
+        page = _FakePage(url=resumed_url)
+        session = _FakeSession()
+        return await collector._collect_one(
+            page, session, downloads_path, "тест", "Россия", resume_directory=run_directory
+        )
+
+    result = asyncio.run(run_resume())
+
+    assert result.manifest.created_at == original_created_at  # start time is untouched
+    assert result.manifest.source_url == resumed_url  # reflects this session's page, not the old one
+    assert result.manifest.source_url != original_source_url
+    # The very first write already sets updated_at (equal to created_at at
+    # that point) — see _collect_one — so null is unambiguous elsewhere as
+    # "predates this field". A resume must bump it forward, never leave it
+    # equal to (let alone before) the interrupted first pass's value.
+    assert original_updated_at is not None
+    assert result.manifest.updated_at is not None
+    assert result.manifest.updated_at > original_updated_at
+
+    on_disk = load_manifest(result.manifest_path)
+    assert on_disk.created_at == original_created_at
+    assert on_disk.source_url == resumed_url
+
+
+def test_collect_one_resume_of_an_already_complete_run_does_not_touch_the_manifest(monkeypatch, tmp_path):
+    """A resume that finds nothing missing (the early return in
+    _collect_one) must not bump updated_at or rewrite source_url — nothing
+    was actually collected in that call, so claiming an update would be a
+    lie."""
+
+    _patch_common(monkeypatch)
+
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector):
+        pass
+
+    async def fake_download(self, page, session, dl_path):
+        source = dl_path / "export.csv"
+        _write_view_csv(source, "тест")
+        return source
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path)
+
+    async def run_full():
+        page = _FakePage(url="https://wordstat.yandex.ru/?words=тест")
+        session = _FakeSession()
+        return await collector._collect_one(page, session, downloads_path, "тест", "Россия")
+
+    first_result = asyncio.run(run_full())
+    manifest_bytes_before = first_result.manifest_path.read_bytes()
+
+    async def run_resume():
+        page = _FakePage(url="https://wordstat.yandex.ru/?words=тест&tab=different")
+        session = _FakeSession()
+        return await collector._collect_one(
+            page, session, downloads_path, "тест", "Россия", resume_directory=first_result.run_directory
+        )
+
+    resumed_result = asyncio.run(run_resume())
+
+    assert resumed_result.manifest.source_url == first_result.manifest.source_url
+    assert resumed_result.manifest.updated_at == first_result.manifest.updated_at
+    assert resumed_result.manifest_path.read_bytes() == manifest_bytes_before
