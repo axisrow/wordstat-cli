@@ -528,6 +528,7 @@ class WordstatCollector:
             f"() => document.querySelector({json.dumps(GRANULARITY_SELECTOR)})?.textContent?.trim() === "
             f"{json.dumps(labels[granularity])}",
         )
+        await self._wait_for_table_granularity(page, granularity)
 
     async def _set_period(self, page, granularity: Granularity, date_from: date, date_to: date | None) -> None:
         if date_to is None:
@@ -537,6 +538,19 @@ class WordstatCollector:
         await self._select_calendar_date(page, popup_type, date_from)
         await self._click(page, DATE_RANGE_SELECTOR)
         await self._select_calendar_date(page, popup_type, date_to)
+        await self._wait_for_table_granularity(page, granularity)
+
+    async def _wait_for_table_granularity(self, page, granularity: Granularity) -> None:
+        patterns = {
+            Granularity.DAILY: r"^\d{1,2}\s+[А-Яа-яЁё]+$",
+            Granularity.WEEKLY: r"^\d{1,2}\s+[А-Яа-яЁё]+\s+\d{4}\s+–\s+\d{1,2}\s+[А-Яа-яЁё]+\s+\d{4}$",
+            Granularity.MONTHLY: r"^[А-Яа-яЁё]+\s+\d{4}$",
+        }
+        expression = (
+            "() => new RegExp(" + json.dumps(patterns[granularity]) + ").test(" 
+            f"document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.textContent?.trim() ?? '')"
+        )
+        await self._wait_for(page, expression)
 
     async def _select_calendar_date(self, page, popup_type: str, target: date) -> None:
         root = f".range-datepicker_type_{popup_type}"
