@@ -57,15 +57,23 @@ VIEW_SELECTORS = {
 def _is_untrustworthy_empty_export(view: WordstatView, dataset: CsvDataset) -> bool:
     """True if an empty CSV for this view can never be a legitimate export.
 
-    Only TOP_POPULAR/TOP_RELATED are checked: _select_view already hard-gates
-    TABLE_ROW_SELECTOR.length > 0 on the DOM before the "Скачать" click is
-    ever issued for these two table-based views (see the docstring on
-    _select_view and CLAUDE.md's issue #3/#13 section) — a phrase with
-    genuinely zero rows never reaches the download step at all, it dies
-    inside _select_view's retry loop with InterfaceChangedError. So by the
+    TOP_POPULAR/TOP_RELATED/DYNAMICS are checked — every view for which
+    _select_view hard-gates TABLE_ROW_SELECTOR.length > 0 on the DOM before
+    the "Скачать" click is ever issued (see the docstring on _select_view
+    and CLAUDE.md's issue #3/#13 section). REGIONS is the only view exempt
+    from that gate (it is a map with no table rows in its DOM), so it is the
+    only view exempt here too — this set must stay in lockstep with
+    _select_view's `if view != WordstatView.REGIONS:` condition, not be
+    picked per-view by hand.
+
+    A phrase that clears the pre-download gate has already had the code
+    itself prove TABLE_ROW_SELECTOR.length > 0 moments earlier; genuinely
+    zero rows never reaches the download step at all — it dies inside
+    _select_view's retry loop with InterfaceChangedError instead. So by the
     time a dataset for one of these views is parsed here, an empty
     dataset.rows already contradicts a state the code itself proved moments
-    earlier; there is no code path left where that emptiness is legitimate.
+    earlier; there is no code path left where that emptiness is legitimate,
+    for any of the three table-based views alike.
 
     This used to be conditioned on a second, post-download DOM read
     (`rendered_rows > 0`) — but re-querying the DOM after the download's
@@ -77,13 +85,18 @@ def _is_untrustworthy_empty_export(view: WordstatView, dataset: CsvDataset) -> b
     proof enough; no second opinion from a later DOM read is needed or
     trustworthy. See tests/test_collector_view.py.
 
-    DYNAMICS is deliberately excluded: issue #11's live-CDP data showed it
-    consistently populated (24 rows across all three runs) while
-    TOP_POPULAR/TOP_RELATED alone were empty, and the problem is specific to
-    those two views, not a general "any table view can be empty" case.
-    REGIONS has no table in its DOM at all and is unrelated.
+    DYNAMICS was previously excluded on the strength of issue #11's live-CDP
+    data (24 rows across three runs, never empty) — but that is evidence the
+    gate rarely fires for DYNAMICS, not evidence that omitting it is safe.
+    The gate's premise is structural (the DOM proved rows>0 immediately
+    before the click), and that premise holds for DYNAMICS exactly as it
+    does for TOP_POPULAR/TOP_RELATED; selecting views by observed frequency
+    of emptiness rather than by the structural gate they share was the bug.
     """
-    return view in (WordstatView.TOP_POPULAR, WordstatView.TOP_RELATED) and not dataset.rows
+    return (
+        view in (WordstatView.TOP_POPULAR, WordstatView.TOP_RELATED, WordstatView.DYNAMICS)
+        and not dataset.rows
+    )
 
 
 def _without_traceback(error: Exception) -> Exception:
