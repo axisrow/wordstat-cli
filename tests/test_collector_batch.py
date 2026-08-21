@@ -526,7 +526,7 @@ def test_collect_one_writes_the_manifest_after_every_view_not_only_at_the_end(mo
     downloads_path = tmp_path / "downloads"
     downloads_path.mkdir()
 
-    async def fake_select_view(self, page, selector):
+    async def fake_select_view(self, page, selector, view):
         pass
 
     call_count = {"n": 0}
@@ -585,7 +585,7 @@ def test_collect_one_resume_directory_only_collects_missing_views(monkeypatch, t
 
     # First pass: run for real, but make it fail right after the first view
     # so the run directory is left genuinely incomplete.
-    async def fake_select_view(self, page, selector):
+    async def fake_select_view(self, page, selector, view):
         pass
 
     call_count = {"n": 0}
@@ -656,7 +656,7 @@ def test_collect_one_resume_directory_rejects_a_different_phrase(monkeypatch, tm
     downloads_path = tmp_path / "downloads"
     downloads_path.mkdir()
 
-    async def fake_select_view(self, page, selector):
+    async def fake_select_view(self, page, selector, view):
         pass
 
     async def fake_download(self, page, session, dl_path):
@@ -716,7 +716,7 @@ def test_collect_one_resume_updates_source_url_and_updated_at_but_not_created_at
     downloads_path = tmp_path / "downloads"
     downloads_path.mkdir()
 
-    async def fake_select_view(self, page, selector):
+    async def fake_select_view(self, page, selector, view):
         pass
 
     async def failing_download(self, page, session, dl_path):
@@ -786,7 +786,7 @@ def test_collect_one_resume_of_an_already_complete_run_does_not_touch_the_manife
     downloads_path = tmp_path / "downloads"
     downloads_path.mkdir()
 
-    async def fake_select_view(self, page, selector):
+    async def fake_select_view(self, page, selector, view):
         pass
 
     async def fake_download(self, page, session, dl_path):
