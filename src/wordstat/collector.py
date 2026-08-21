@@ -533,7 +533,9 @@ class WordstatCollector:
     async def _set_period(self, page, granularity: Granularity, date_from: date, date_to: date | None) -> None:
         if date_to is None:
             raise InvalidRequestError("A period end date is required when a start date is provided")
-        popup_type = "month" if granularity is Granularity.MONTHLY else "day"
+        popup_type = "month" if granularity is Granularity.MONTHLY else (
+            "week" if granularity is Granularity.WEEKLY else "day"
+        )
         await self._click(page, DATE_RANGE_SELECTOR)
         await self._select_calendar_date(page, popup_type, date_from)
         await self._click(page, DATE_RANGE_SELECTOR)
@@ -579,7 +581,7 @@ class WordstatCollector:
             )
         await self._click(page, year_selector)
         await self._click_visible_text(page, ".Popup2_visible [role='option']", str(target.year))
-        if popup_type == "day":
+        if popup_type in {"day", "week"}:
             await self._click(page, month_selector)
             await self._click_visible_text(page, ".Popup2_visible [role='option']", month_label)
         day_selector = f"{root} button[name='day']"
