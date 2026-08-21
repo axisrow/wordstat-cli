@@ -5,7 +5,7 @@ import json
 import tempfile
 import time
 from collections.abc import Callable
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from browser_use.browser import BrowserSession
@@ -430,6 +430,8 @@ class WordstatCollector:
                         f"Wordstat returned an empty {view.value} CSV after a retry, but the page had rendered "
                         "at least one table row before the download was triggered; export is not trustworthy"
                     )
+                if view is WordstatView.DYNAMICS:
+                    self._assert_contiguous_dynamics_rows(dataset, granularity)
                 file_name = self._dynamics_file_name(granularity) if view is WordstatView.DYNAMICS else None
                 if file_name is None:
                     data_path, dtypes = write_dataset(dataset, run_directory)
@@ -486,6 +488,25 @@ class WordstatCollector:
             return None
         field = dataset.headers[0]
         return {"field": field, "from": dataset.rows[0][field], "to": dataset.rows[-1][field]}
+
+    @staticmethod
+    def _assert_contiguous_dynamics_rows(dataset: CsvDataset, granularity: Granularity) -> None:
+        if granularity is Granularity.MONTHLY or len(dataset.rows) < 2:
+            return
+        field = dataset.headers[0]
+        try:
+            dates = [datetime.strptime(row[field], "%d.%m.%Y").date() for row in dataset.rows]
+        except ValueError as error:
+            raise InterfaceChangedError(
+                f"Wordstat returned an unexpected {granularity.value} dynamics date format"
+            ) from error
+        step = timedelta(days=1 if granularity is Granularity.DAILY else 7)
+        for previous, current in zip(dates, dates[1:]):
+            if current - previous != step:
+                raise InterfaceChangedError(
+                    f"Wordstat returned a gap in the {granularity.value} dynamics series "
+                    f"between {previous:%d.%m.%Y} and {current:%d.%m.%Y}"
+                )
 
 
     @staticmethod
