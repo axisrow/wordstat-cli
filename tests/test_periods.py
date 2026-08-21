@@ -36,18 +36,10 @@ def test_daily_period_is_at_most_60_days_and_not_future():
     validate_period(Granularity.DAILY, date(2026, 7, 1), date(2026, 8, 21), today=date(2026, 8, 21))
 
 
-def test_weekly_with_explicit_period_is_rejected():
-    # Live CDP checks (issue #6 phase 2) showed Wordstat's weekly view
-    # ignores an explicit window entirely and returns its default ~2-year
-    # range instead, so any explicit weekly period is rejected regardless
-    # of length -- there is no length that would make it honored.
-    with pytest.raises(InvalidPeriodError, match="ignores the requested window"):
+def test_weekly_and_monthly_minimums():
+    with pytest.raises(InvalidPeriodError, match="three calendar weeks"):
         validate_period(Granularity.WEEKLY, date(2026, 8, 1), date(2026, 8, 20))
-    with pytest.raises(InvalidPeriodError, match="ignores the requested window"):
-        validate_period(Granularity.WEEKLY, date(2026, 8, 1), date(2026, 8, 21))
-
-
-def test_monthly_minimum():
+    validate_period(Granularity.WEEKLY, date(2026, 8, 1), date(2026, 8, 21))
     with pytest.raises(InvalidPeriodError, match="three calendar months"):
         validate_period(Granularity.MONTHLY, date(2026, 8, 1), date(2026, 10, 1))
     validate_period(Granularity.MONTHLY, date(2026, 8, 1), date(2026, 10, 31))

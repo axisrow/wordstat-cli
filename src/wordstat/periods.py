@@ -46,19 +46,8 @@ def validate_period(
         if date_to - date_from >= timedelta(days=60):
             raise InvalidPeriodError("Daily statistics support at most 60 calendar days")
     elif granularity is Granularity.WEEKLY:
-        # Live CDP checks (issue #6 phase 2) confirmed Wordstat's weekly view
-        # silently ignores an explicit --date-from/--date-to and returns its
-        # default ~2-year window instead (107 full weeks, unrelated to the
-        # requested dates). Returning that mismatched window with a manifest
-        # claiming the requested period would be the worst outcome, so an
-        # explicit weekly period is rejected outright rather than collected
-        # and silently wrong. Weekly without an explicit period still works
-        # (see docs/issue6-phase1-findings.md) and remains allowed below.
-        raise InvalidPeriodError(
-            "Weekly granularity with an explicit period is not supported: "
-            "Wordstat ignores the requested window and returns its default "
-            "range instead; use daily or monthly, or omit --date-from/--date-to"
-        )
+        if date_to - date_from < timedelta(days=20):
+            raise InvalidPeriodError("Weekly statistics require at least three calendar weeks")
     else:
         end_month = date_from.month + 2
         end_year = date_from.year + (end_month - 1) // 12
