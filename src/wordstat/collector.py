@@ -479,7 +479,9 @@ class WordstatCollector:
                         "at least one table row before the download was triggered; export is not trustworthy"
                     )
                 if view is WordstatView.DYNAMICS:
-                    self._assert_contiguous_dynamics_rows(dataset, granularity)
+                    self._assert_contiguous_dynamics_rows(
+                        dataset, granularity, date_from=date_from, date_to=date_to
+                    )
                 file_name = self._dynamics_file_name(granularity) if view is WordstatView.DYNAMICS else None
                 if file_name is None:
                     data_path, dtypes = write_dataset(dataset, run_directory)
@@ -538,7 +540,12 @@ class WordstatCollector:
         return {"field": field, "from": dataset.rows[0][field], "to": dataset.rows[-1][field]}
 
     @staticmethod
-    def _assert_contiguous_dynamics_rows(dataset: CsvDataset, granularity: Granularity) -> None:
+    def _assert_contiguous_dynamics_rows(
+        dataset: CsvDataset,
+        granularity: Granularity,
+        date_from: date | None = None,
+        date_to: date | None = None,
+    ) -> None:
         if granularity is Granularity.MONTHLY or len(dataset.rows) < 2:
             return
         field = dataset.headers[0]
@@ -554,6 +561,42 @@ class WordstatCollector:
                 raise InterfaceChangedError(
                     f"Wordstat returned a gap in the {granularity.value} dynamics series "
                     f"between {previous:%d.%m.%Y} and {current:%d.%m.%Y}"
+                )
+        # Containment, not equality: a shorter export fully inside the
+        # requested window is legitimate (the daily series' variable
+        # trailing tail, confirmed live — issue #6 phase 1 document), so
+        # this never compares dates[0]/dates[-1] against date_from/date_to
+        # for exact equality. What it does reject is a row *outside* the
+        # requested window in either direction — the live race this guards
+        # against (collector.py:603, _wait_for_period_applied) confirms
+        # only the first cell's format+value match date_from before
+        # downloading; it has no equivalent check for date_to, so a table
+        # that has not yet repainted past a previous, stale window can
+        # download and be recorded as complete with data that never
+        # entered the requested window at all. Only applies when an
+        # explicit period was requested (date_from/date_to are None for
+        # the UI's default window, which this function cannot validate
+        # against any specific boundary).
+        if date_from is not None and date_to is not None:
+            # Weekly rows are keyed by the Monday of date_from's week, not
+            # date_from itself (confirmed live — _wait_for_period_applied's
+            # own comment above), so the lower bound must be that aligned
+            # Monday, not the raw requested date, or a legitimate alignment
+            # would be misreported as a stale window.
+            lower_bound = (
+                date_from - timedelta(days=date_from.weekday())
+                if granularity is Granularity.WEEKLY
+                else date_from
+            )
+            if dates[0] < lower_bound:
+                raise InterfaceChangedError(
+                    f"Wordstat {granularity.value} dynamics export starts at {dates[0]:%d.%m.%Y}, "
+                    f"before the requested window start {lower_bound:%d.%m.%Y}"
+                )
+            if dates[-1] > date_to:
+                raise InterfaceChangedError(
+                    f"Wordstat {granularity.value} dynamics export ends at {dates[-1]:%d.%m.%Y}, "
+                    f"after the requested window end {date_to:%d.%m.%Y}"
                 )
 
 
@@ -600,6 +643,18 @@ class WordstatCollector:
         # Waiting for the first cell to actually start at the expected
         # date closes that gap, and turns a silent wrong-period export
         # into a loud InterfaceChangedError if the picker never catches up.
+        #
+        # This only confirms the *start* boundary (date_from), because it
+        # runs before the download and only the first row is visible/known
+        # at this point. It does not by itself prove the *end* boundary
+        # (date_to) has also repainted — a table that has advanced its
+        # first row but not yet its last row would pass this wait and
+        # still download a stale end. The end boundary is guarded
+        # separately, after the download, by
+        # _assert_contiguous_dynamics_rows' containment check against the
+        # actually-exported rows (confirmed as a real gap during review,
+        # not just theory) — that is the authoritative defense for
+        # date_to, not an earlier DOM-state wait for it.
         await self._wait_for_period_applied(page, granularity, date_from)
 
     async def _wait_for_period_applied(self, page, granularity: Granularity, date_from: date) -> None:

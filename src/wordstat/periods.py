@@ -29,7 +29,9 @@ def validate_period(
 
     Omitted dates leave the UI's default window untouched. The five-year
     maximum is deliberately not enforced because phase 1 did not establish
-    it as a reliable live fact.
+    it as a reliable live fact — unlike the daily lower bound below, which
+    is a confirmed live limitation of the picker itself, not a policy
+    choice.
     """
     if (date_from is None) != (date_to is None):
         raise InvalidPeriodError("--date-from and --date-to must be provided together")
@@ -45,6 +47,20 @@ def validate_period(
             raise InvalidPeriodError("Daily statistics cannot be requested after today")
         if date_to - date_from >= timedelta(days=60):
             raise InvalidPeriodError("Daily statistics support at most 60 calendar days")
+        # Live CDP measurement (issue #6 phase 2): the daily date-range
+        # picker's year-select popup only ever offers the current year, so
+        # a date_from further back than the trailing 60-day window cannot
+        # actually be selected in the live UI at all — it currently reaches
+        # Chrome and fails deep inside calendar-click code with an opaque
+        # InterfaceChangedError instead of a clear pre-flight rejection.
+        # Expressed relative to `today` (not "reject any year but the
+        # current one" — that would wrongly reject legal windows in
+        # January) and kept consistent with the existing 60-day window
+        # check above: PR #20's live-confirmed window 22.06.2026-20.08.2026,
+        # measured on 21.08.2026, is exactly 60 days back from today and
+        # must remain accepted.
+        if current - date_from > timedelta(days=60):
+            raise InvalidPeriodError("Daily statistics cannot start more than 60 days in the past")
     elif granularity is Granularity.WEEKLY:
         if date_to - date_from < timedelta(days=20):
             raise InvalidPeriodError("Weekly statistics require at least three calendar weeks")
