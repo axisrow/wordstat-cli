@@ -428,6 +428,177 @@ def _write_view_csv(path, phrase):
     path.write_text("Запрос;Показов\nянварь 2024;100\n", encoding="cp1251")
 
 
+def _write_empty_view_csv(path):
+    path.write_text("Запрос;Показов\n", encoding="cp1251")
+
+
+def test_collect_one_retries_empty_table_exports_using_csv_content(monkeypatch, tmp_path):
+    """An already-rendered DOM table is not export readiness.
+
+    The first download for each table view is header-only, then the export
+    blob becomes populated. The collector must use the parsed CSV as the
+    retry signal and must not use the old DOM row gate as proof that the first
+    download was ready.
+    """
+
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    download_count = 0
+
+    async def fake_download(self, page, session, dl_path):
+        nonlocal download_count
+        download_count += 1
+        source = dl_path / f"export-{download_count}.csv"
+        if download_count in (1, 3):
+            _write_empty_view_csv(source)
+        else:
+            _write_view_csv(source, "тест")
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+    result = asyncio.run(
+        collector._collect_one(
+            _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
+        )
+    )
+
+    assert download_count == 6  # top views each needed one content-based retry
+    assert {export.view for export in result.manifest.exports} == set(WordstatView)
+    assert all(export.row_count == 1 for export in result.manifest.exports)
+
+
+def test_collect_one_accepts_persistent_empty_top_exports_after_retry(monkeypatch, tmp_path):
+    """Retrying top exports must not restore PR #25's fail-closed regression."""
+
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    download_count = 0
+
+    async def fake_download(self, page, session, dl_path):
+        nonlocal download_count
+        download_count += 1
+        source = dl_path / f"export-{download_count}.csv"
+        if download_count <= 4:
+            _write_empty_view_csv(source)
+        else:
+            _write_view_csv(source, "тест")
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+    result = asyncio.run(
+        collector._collect_one(
+            _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
+        )
+    )
+
+    assert download_count == 6
+    assert result.view_errors == {}
+    assert [export.row_count for export in result.manifest.exports[:2]] == [0, 0]
+    # The manifest's existing computed fields are the operator-visible trace:
+    # both exports remain present, but their emptiness keeps the run visibly
+    # incomplete instead of allowing a silent all-clear.
+    assert result.manifest.empty_views == [WordstatView.TOP_POPULAR, WordstatView.TOP_RELATED]
+    assert result.manifest.status == "incomplete"
+    on_disk = load_manifest(result.manifest_path)
+    assert on_disk.empty_views == result.manifest.empty_views
+    assert on_disk.status == result.manifest.status
+    assert all(export.row_count == 1 for export in result.manifest.exports[2:])
+
+
+def test_collect_one_keeps_dynamics_empty_export_fail_closed(monkeypatch, tmp_path):
+    """The top-view retry must not change DYNAMICS' existing safety path."""
+
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    download_count = 0
+
+    async def fake_download(self, page, session, dl_path):
+        nonlocal download_count
+        download_count += 1
+        source = dl_path / f"export-{download_count}.csv"
+        if download_count >= 3:
+            _write_empty_view_csv(source)
+        else:
+            _write_view_csv(source, "тест")
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+    result = asyncio.run(
+        collector._collect_one(
+            _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
+        )
+    )
+
+    assert download_count == 4  # dynamics gets its existing one retry
+    assert [export.view for export in result.manifest.exports] == [
+        WordstatView.TOP_POPULAR,
+        WordstatView.TOP_RELATED,
+    ]
+    assert WordstatView.DYNAMICS in result.view_errors
+    assert "empty dynamics CSV after a retry" in result.view_errors[WordstatView.DYNAMICS]
+
+
+def test_collect_one_does_not_retry_an_empty_regions_export(monkeypatch, tmp_path):
+    """REGIONS has no table gate, so its empty export gets no table retry."""
+
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    download_count = 0
+
+    async def fake_download(self, page, session, dl_path):
+        nonlocal download_count
+        download_count += 1
+        source = dl_path / f"export-{download_count}.csv"
+        if download_count < 4:
+            _write_view_csv(source, "тест")
+        else:
+            _write_empty_view_csv(source)
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+    result = asyncio.run(
+        collector._collect_one(
+            _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
+        )
+    )
+
+    assert download_count == 4
+    assert result.manifest.exports[-1].view is WordstatView.REGIONS
+    assert result.manifest.exports[-1].row_count == 0
+
+
 def test_collect_one_preserves_a_table_snapshot_for_the_next_phrase(monkeypatch, tmp_path):
     """The map is last, so the next phrase must not snapshot it as None."""
 
