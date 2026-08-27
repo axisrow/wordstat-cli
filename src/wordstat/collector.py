@@ -872,20 +872,16 @@ class WordstatCollector:
         # date closes that gap, and turns a silent wrong-period export
         # into a loud InterfaceChangedError if the picker never catches up.
         #
-        # This only confirms the *start* boundary (date_from), because it
-        # runs before the download and only the first row is visible/known
-        # at this point. It does not by itself prove the *end* boundary
-        # (date_to) has also repainted — a table that has advanced its
-        # first row but not yet its last row would pass this wait and
-        # still download a stale end. The end boundary is guarded
-        # separately, after the download, by
-        # _assert_contiguous_dynamics_rows' containment check against the
-        # actually-exported rows (confirmed as a real gap during review,
-        # not just theory) — that is the authoritative defense for
-        # date_to, not an earlier DOM-state wait for it.
-        await self._wait_for_period_applied(page, granularity, date_from)
+        # The table can repaint its first row before its last row. Waiting
+        # only for date_from therefore lets a stale end through when the
+        # requested start happens to equal the old window's start. The
+        # post-download containment check remains authoritative, but wait for
+        # the visible last row to enter the requested window first as well.
+        await self._wait_for_period_applied(page, granularity, date_from, date_to)
 
-    async def _wait_for_period_applied(self, page, granularity: Granularity, date_from: date) -> None:
+    async def _wait_for_period_applied(
+        self, page, granularity: Granularity, date_from: date, date_to: date | None = None
+    ) -> None:
         # The month name in the first cell is genitive ("22 июня", "24
         # декабря" — day-of/week-of a date) for daily/weekly, but
         # nominative ("август 2024") for monthly (confirmed live, issue #6
@@ -906,11 +902,40 @@ class WordstatCollector:
             week_start = date_from - timedelta(days=date_from.weekday())
             expected = f"{week_start.day} {RUSSIAN_MONTHS_GENITIVE[week_start.month - 1]} {week_start.year}"
         pattern = "^" + re.escape(expected)
-        await self._wait_for(
-            page,
+        expression = (
             f"() => new RegExp({json.dumps(pattern)}).test("
             f"document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.querySelector('td')"
-            "?.textContent?.trim() ?? '')",
+            "?.textContent?.trim() ?? '')"
+        )
+        if date_to is not None and granularity is not Granularity.MONTHLY:
+            # Daily exports may legitimately end before date_to because
+            # Wordstat's trailing data tail is variable. Accept every
+            # possible date in the requested range instead of waiting for an
+            # exact end-date match. Weekly rows are keyed by their Monday,
+            # so use the same aligned lower bound as the CSV containment
+            # check below.
+            lower_bound = (
+                date_from - timedelta(days=date_from.weekday())
+                if granularity is Granularity.WEEKLY
+                else date_from
+            )
+            step = timedelta(days=7 if granularity is Granularity.WEEKLY else 1)
+            last_row_patterns = []
+            candidate = lower_bound
+            while candidate <= date_to:
+                month = RUSSIAN_MONTHS_GENITIVE[candidate.month - 1]
+                year = f" {candidate.year}" if granularity is Granularity.WEEKLY else ""
+                last_row_patterns.append(re.escape(f"{candidate.day} {month}{year}"))
+                candidate += step
+            last_row_pattern = "^(?:" + "|".join(last_row_patterns) + ")"
+            expression += (
+                f" && new RegExp({json.dumps(last_row_pattern)}).test("
+                f"[...document.querySelectorAll({json.dumps(TABLE_ROW_SELECTOR)})].at(-1)"
+                "?.querySelector('td')?.textContent?.trim() ?? '')"
+            )
+        await self._wait_for(
+            page,
+            expression,
         )
 
     async def _wait_for_table_granularity(self, page, granularity: Granularity) -> None:
