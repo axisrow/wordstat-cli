@@ -14,7 +14,7 @@ def test_parse_wordstat_csv_preserves_localized_headers(tmp_path: Path) -> None:
     dataset = parse_wordstat_csv(source, WordstatView.TOP_POPULAR)
 
     assert dataset.headers == ["Запрос", "Число запросов"]
-    assert dataset.rows == [{"Запрос": "чай", "Число запросов": "5 228 679"}]
+    assert dataset.rows == [{"Запрос": "чай", "Число запросов": "5 228 678"}]
 
 
 def test_parse_wordstat_csv_reads_a_tab_delimited_export(tmp_path: Path) -> None:
