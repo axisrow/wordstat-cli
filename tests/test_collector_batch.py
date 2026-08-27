@@ -560,6 +560,43 @@ def test_collect_one_keeps_dynamics_empty_export_fail_closed(monkeypatch, tmp_pa
     assert "empty dynamics CSV after a retry" in result.view_errors[WordstatView.DYNAMICS]
 
 
+def test_collect_one_does_not_retry_an_empty_regions_export(monkeypatch, tmp_path):
+    """REGIONS has no table gate, so its empty export gets no table retry."""
+
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    download_count = 0
+
+    async def fake_download(self, page, session, dl_path):
+        nonlocal download_count
+        download_count += 1
+        source = dl_path / f"export-{download_count}.csv"
+        if download_count < 4:
+            _write_view_csv(source, "тест")
+        else:
+            _write_empty_view_csv(source)
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+    result = asyncio.run(
+        collector._collect_one(
+            _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
+        )
+    )
+
+    assert download_count == 4
+    assert result.manifest.exports[-1].view is WordstatView.REGIONS
+    assert result.manifest.exports[-1].row_count == 0
+
+
 def test_collect_one_preserves_a_table_snapshot_for_the_next_phrase(monkeypatch, tmp_path):
     """The map is last, so the next phrase must not snapshot it as None."""
 
