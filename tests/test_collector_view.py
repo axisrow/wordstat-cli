@@ -291,10 +291,16 @@ def test_wait_for_period_applied_weekly_matches_genitive_cell_text_and_aligns_to
 
 def test_wait_for_period_applied_monthly_matches_nominative_cell_text(monkeypatch, tmp_path):
     collector, captured = _captured_pattern(monkeypatch, tmp_path)
-    asyncio.run(collector._wait_for_period_applied(object(), Granularity.MONTHLY, date(2024, 8, 1)))
+    asyncio.run(
+        collector._wait_for_period_applied(
+            object(), Granularity.MONTHLY, date(2024, 8, 1), date(2024, 12, 31)
+        )
+    )
     pattern = _extract_regex(captured["expression"])
     assert pattern.search("август 2024")
     assert not pattern.search("сентябрь 2024")
+    assert "querySelectorAll" not in captured["expression"]
+    assert ".at(-1)" not in captured["expression"]
 
 
 def test_set_period_does_not_reopen_the_monthly_popup_between_dates(monkeypatch, tmp_path):
