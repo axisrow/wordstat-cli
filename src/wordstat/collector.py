@@ -73,6 +73,15 @@ RUSSIAN_MONTHS_GENITIVE = (
 )
 
 
+def _parse_monthly_dynamics_period(value: str) -> date:
+    """Parse Wordstat's nominative Russian month/year period label."""
+    month_name, year_text = value.split()
+    if not re.fullmatch(r"\d{4}", year_text):
+        raise ValueError(value)
+    month = RUSSIAN_MONTHS.index(month_name) + 1
+    return date(int(year_text), month, 1)
+
+
 def _is_untrustworthy_empty_export(view: WordstatView, dataset: CsvDataset) -> bool:
     """True if an empty CSV for this view can never be a legitimate export.
 
@@ -682,8 +691,10 @@ class WordstatCollector:
         date_from: date | None = None,
         date_to: date | None = None,
     ) -> None:
-        # This parses dataset.rows[field] — the exported CSV's date column
-        # — with strptime("%d.%m.%Y"), NOT the DOM's displayed cell text.
+        # This parses dataset.rows[field] — the exported CSV's period column,
+        # not the DOM's displayed cell text. Daily and weekly exports contain
+        # DD.MM.YYYY; monthly exports contain a nominative Russian month and
+        # year such as "август 2024".
         # Live-measured weekly CSV (issue #6 phase 1 document — see
         # `docs/ISSUE6_PHASE1_RESEARCH.md` on the PR #20 branch,
         # `git show 4be8996:docs/ISSUE6_PHASE1_RESEARCH.md`): the exported
@@ -699,29 +710,31 @@ class WordstatCollector:
         # 2's RR1 both raised this same claim from reading the code
         # without this doc open; both were false positives).
         #
-        # Monthly's period field is a nominative Russian month name
-        # ("август 2024", confirmed live — issue #6 phase 1 document), not
-        # a strptime("%d.%m.%Y")-parseable date the way daily/weekly are,
-        # so neither contiguity nor containment can be validated here for
-        # it; _wait_for_period_applied still gates monthly's start
-        # boundary before download (same mechanism as daily/weekly), and
-        # _actual_period records the raw field/from/to strings into the
-        # manifest for every dynamics export including monthly, so actual
-        # coverage stays observable post-hoc even without this check
-        # (cycle-review round 2, C2 triage).
-        if granularity is Granularity.MONTHLY or not dataset.rows:
+        if not dataset.rows:
             return
         field = dataset.headers[0]
         try:
-            dates = [datetime.strptime(row[field], "%d.%m.%Y").date() for row in dataset.rows]
+            if granularity is Granularity.MONTHLY:
+                dates = [_parse_monthly_dynamics_period(row[field]) for row in dataset.rows]
+            else:
+                dates = [datetime.strptime(row[field], "%d.%m.%Y").date() for row in dataset.rows]
         except ValueError as error:
             raise InterfaceChangedError(
                 f"Wordstat returned an unexpected {granularity.value} dynamics date format"
             ) from error
         if len(dates) >= 2:
-            step = timedelta(days=1 if granularity is Granularity.DAILY else 7)
             for previous, current in zip(dates, dates[1:]):
-                if current - previous != step:
+                if granularity is Granularity.MONTHLY:
+                    expected = date(
+                        previous.year + (previous.month == 12),
+                        previous.month % 12 + 1,
+                        1,
+                    )
+                    contiguous = current == expected
+                else:
+                    step = timedelta(days=1 if granularity is Granularity.DAILY else 7)
+                    contiguous = current - previous == step
+                if not contiguous:
                     raise InterfaceChangedError(
                         f"Wordstat returned a gap in the {granularity.value} dynamics series "
                         f"between {previous:%d.%m.%Y} and {current:%d.%m.%Y}"
@@ -754,20 +767,25 @@ class WordstatCollector:
             # own comment above), so the lower bound must be that aligned
             # Monday, not the raw requested date, or a legitimate alignment
             # would be misreported as a stale window.
-            lower_bound = (
-                date_from - timedelta(days=date_from.weekday())
-                if granularity is Granularity.WEEKLY
-                else date_from
-            )
+            if granularity is Granularity.MONTHLY:
+                lower_bound = date(date_from.year, date_from.month, 1)
+                upper_bound = date(date_to.year, date_to.month, 1)
+            else:
+                lower_bound = (
+                    date_from - timedelta(days=date_from.weekday())
+                    if granularity is Granularity.WEEKLY
+                    else date_from
+                )
+                upper_bound = date_to
             if dates[0] < lower_bound:
                 raise InterfaceChangedError(
                     f"Wordstat {granularity.value} dynamics export starts at {dates[0]:%d.%m.%Y}, "
                     f"before the requested window start {lower_bound:%d.%m.%Y}"
                 )
-            if dates[-1] > date_to:
+            if dates[-1] > upper_bound:
                 raise InterfaceChangedError(
                     f"Wordstat {granularity.value} dynamics export ends at {dates[-1]:%d.%m.%Y}, "
-                    f"after the requested window end {date_to:%d.%m.%Y}"
+                    f"after the requested window end {upper_bound:%d.%m.%Y}"
                 )
 
 

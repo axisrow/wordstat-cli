@@ -423,7 +423,9 @@ async def _async(value):
 
 
 def _write_view_csv(path, phrase):
-    path.write_text(f"Запрос;Показов\n{phrase};100\n", encoding="cp1251")
+    # _collect_one defaults to monthly dynamics. Keep the generic fake export
+    # valid for that view as well as for the other view types.
+    path.write_text("Запрос;Показов\nянварь 2024;100\n", encoding="cp1251")
 
 
 def test_collect_one_preserves_a_table_snapshot_for_the_next_phrase(monkeypatch, tmp_path):

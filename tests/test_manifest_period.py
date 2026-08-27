@@ -129,3 +129,42 @@ def test_weekly_containment_uses_the_aligned_week_start_not_the_raw_request():
     WordstatCollector._assert_contiguous_dynamics_rows(
         dataset, Granularity.WEEKLY, date_from=date(2018, 12, 26), date_to=date(2019, 1, 13)
     )
+
+
+def test_monthly_containment_uses_actual_month_boundaries():
+    dataset = CsvDataset(
+        view=WordstatView.DYNAMICS,
+        headers=["Период"],
+        rows=[
+            {"Период": "июнь 2026"},
+            {"Период": "июль 2026"},
+            {"Период": "август 2026"},
+        ],
+    )
+
+    with pytest.raises(InterfaceChangedError, match="requested window"):
+        WordstatCollector._assert_contiguous_dynamics_rows(
+            dataset, Granularity.MONTHLY, date_from=date(2026, 7, 15), date_to=date(2026, 8, 20)
+        )
+
+    with pytest.raises(InterfaceChangedError, match="requested window"):
+        WordstatCollector._assert_contiguous_dynamics_rows(
+            dataset, Granularity.MONTHLY, date_from=date(2026, 6, 1), date_to=date(2026, 7, 31)
+        )
+
+    # Date requests are day-granular, but monthly rows are compared by their
+    # containing months, so the June-August export is inside this window.
+    WordstatCollector._assert_contiguous_dynamics_rows(
+        dataset, Granularity.MONTHLY, date_from=date(2026, 6, 15), date_to=date(2026, 8, 20)
+    )
+
+
+def test_monthly_contiguity_rejects_a_missing_month():
+    dataset = CsvDataset(
+        view=WordstatView.DYNAMICS,
+        headers=["Период"],
+        rows=[{"Период": "декабрь 2023"}, {"Период": "февраль 2024"}],
+    )
+
+    with pytest.raises(InterfaceChangedError, match="gap"):
+        WordstatCollector._assert_contiguous_dynamics_rows(dataset, Granularity.MONTHLY)
