@@ -131,6 +131,20 @@ def _is_untrustworthy_empty_export(view: WordstatView, dataset: CsvDataset) -> b
     return view is WordstatView.DYNAMICS and not dataset.rows
 
 
+def _should_retry_empty_export(view: WordstatView, dataset: CsvDataset) -> bool:
+    """Return whether an empty CSV deserves one content-based retry.
+
+    The table-row gate in ``_select_view`` only proves that the page rendered
+    rows; it does not prove that the export blob used by the download link has
+    been rebuilt.  The parsed CSV is the first signal that describes the
+    export itself, so an empty result is the retry trigger rather than another
+    DOM read.  Top views may still legitimately remain empty (see
+    ``_is_untrustworthy_empty_export``), so retrying and rejecting an export
+    are deliberately separate decisions.
+    """
+    return view in (WordstatView.TOP_POPULAR, WordstatView.TOP_RELATED) and not dataset.rows
+
+
 def _without_traceback(error: Exception) -> Exception:
     """Drop the traceback before an exception is stashed in PhraseFailure.
 
@@ -180,10 +194,11 @@ class WordstatCollector:
         # non-map), so +50s across a 50-phrase batch. Do not remove without
         # a way to verify nothing regresses against a live run.
         #
-        # empty_export_retry_seconds: unlike the above, this one does have
-        # a concrete, structural trigger — it only fires after
-        # _is_untrustworthy_empty_export has already caught a table-visible-
-        # but-CSV-empty export on this specific run, not preventively.
+        # empty_export_retry_seconds: unlike the above, this one fires only
+        # after the parsed CSV itself is empty, not preventively from a DOM
+        # observation. It retries the two top views, whose second empty result
+        # remains a legitimate ExportSummary; DYNAMICS keeps its existing
+        # fail-closed retry path below.
         self.settling_seconds = settling_seconds
         self.empty_export_retry_seconds = empty_export_retry_seconds
         self._previous_table_snapshot: str | None = None
@@ -558,10 +573,13 @@ class WordstatCollector:
                 try:
                     # Convert before disposing of the download, so a parse or
                     # write failure leaves the raw CSV on disk to inspect. The
-                    # live export blob can lag the table repaint once; retry an
-                    # empty table export once before failing closed.
+                    # live export blob can lag the table repaint once. The
+                    # parsed CSV, not the already-passing DOM row gate, is the
+                    # signal used to trigger one retry. Top views can still be
+                    # legitimately empty after that retry, so this is kept
+                    # separate from the fail-closed predicate below.
                     dataset = parse_wordstat_csv(source, view)
-                    if _is_untrustworthy_empty_export(view, dataset):
+                    if _should_retry_empty_export(view, dataset) or _is_untrustworthy_empty_export(view, dataset):
                         if self.empty_export_retry_seconds > 0:
                             await asyncio.sleep(self.empty_export_retry_seconds)
                         source, escape_warning = await self._download_current_view(page, session, downloads_path)
