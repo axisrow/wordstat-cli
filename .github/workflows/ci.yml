@@ -13,3 +13,5 @@ jobs:
       - uses: astral-sh/setup-uv@v3
       - name: ruff check
         run: uvx ruff check .
+      - name: pytest
+        run: uv run --no-sources pytest -q
