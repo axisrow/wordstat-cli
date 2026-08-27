@@ -1,6 +1,7 @@
 """View-selection retry behavior without touching a browser."""
 
 import asyncio
+import json
 import re
 from datetime import date
 
@@ -257,6 +258,27 @@ def test_wait_for_period_applied_daily_matches_genitive_cell_text(monkeypatch, t
     assert not pattern.search("22 июля")
 
 
+def test_wait_for_period_applied_daily_waits_for_last_row_inside_requested_window(monkeypatch, tmp_path):
+    collector, captured = _captured_pattern(monkeypatch, tmp_path)
+    asyncio.run(
+        collector._wait_for_period_applied(
+            object(), Granularity.DAILY, date(2026, 6, 28), date(2026, 8, 23)
+        )
+    )
+
+    expression = captured["expression"]
+    assert "querySelectorAll" in expression
+    assert ".at(-1)" in expression
+    # A stale default ending after the requested end must not satisfy the
+    # readiness expression, while a legitimate short tail remains allowed.
+    last_pattern_start = expression.index("new RegExp(", expression.index("&&")) + len("new RegExp(")
+    last_pattern_end = expression.index(").test", last_pattern_start)
+    last_pattern = re.compile(json.loads(expression[last_pattern_start:last_pattern_end]))
+    assert last_pattern.search("23 августа")
+    assert last_pattern.search("20 августа")
+    assert not last_pattern.search("24 августа")
+
+
 def test_wait_for_period_applied_weekly_matches_genitive_cell_text_and_aligns_to_monday(monkeypatch, tmp_path):
     collector, captured = _captured_pattern(monkeypatch, tmp_path)
     # 2018-12-26 is a Wednesday; the first cell is the Monday of that week.
@@ -299,8 +321,8 @@ def test_set_period_does_not_reopen_the_monthly_popup_between_dates(monkeypatch,
     async def select_calendar_date(self, page, popup_type, target):
         calls.append(("select_calendar_date", popup_type, target))
 
-    async def wait_for_period_applied(self, page, granularity, date_from):
-        calls.append(("wait_for_period_applied", granularity, date_from))
+    async def wait_for_period_applied(self, page, granularity, date_from, date_to):
+        calls.append(("wait_for_period_applied", granularity, date_from, date_to))
 
     monkeypatch.setattr(WordstatCollector, "_click", click)
     monkeypatch.setattr(WordstatCollector, "_select_calendar_date", select_calendar_date)
@@ -318,6 +340,7 @@ def test_set_period_does_not_reopen_the_monthly_popup_between_dates(monkeypatch,
         ("select_calendar_date", "month", date(2024, 1, 1)),
         ("select_calendar_date", "month", date(2024, 6, 30)),
     ]
+    assert ("wait_for_period_applied", Granularity.MONTHLY, date(2024, 1, 1), date(2024, 6, 30)) in calls
 
 
 def test_set_period_still_reopens_the_popup_between_dates_for_day_and_week(monkeypatch, tmp_path):
@@ -332,7 +355,7 @@ def test_set_period_still_reopens_the_popup_between_dates_for_day_and_week(monke
     async def select_calendar_date(self, page, popup_type, target):
         pass
 
-    async def wait_for_period_applied(self, page, granularity, date_from):
+    async def wait_for_period_applied(self, page, granularity, date_from, date_to):
         pass
 
     monkeypatch.setattr(WordstatCollector, "_click", click)
