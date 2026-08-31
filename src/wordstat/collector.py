@@ -1146,6 +1146,7 @@ class WordstatCollector:
         max_attempts = 3
         state = None
         matched = False
+        attempt_states = []
         for _ in range(max_attempts):
             elements = await page.get_elements_by_css_selector(QUERY_SELECTOR)
             if len(elements) != 1:
@@ -1159,12 +1160,46 @@ class WordstatCollector:
                     }})"""
                 )
             )
+            attempt_states.append(state)
+            if state["value"] == phrase and state["searchDisabled"] is False:
+                matched = True
+                break
+            # ``fill`` types one character at a time.  If the controlled
+            # input lost any of those events, replace its value atomically
+            # and emit the events React listens to.  The native setter is
+            # intentional: assigning ``input.value`` directly can leave
+            # React's value tracker unchanged, while using the prototype
+            # setter followed by input/change updates the controlled state.
+            await page.evaluate(
+                f"""() => {{
+                    const input = document.querySelector({query_selector});
+                    if (!input) return false;
+                    const setter = Object.getOwnPropertyDescriptor(
+                        HTMLInputElement.prototype, 'value'
+                    )?.set;
+                    if (!setter) return false;
+                    input.focus();
+                    setter.call(input, {json.dumps(phrase)});
+                    input.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    input.dispatchEvent(new Event('change', {{bubbles: true}}));
+                    return true;
+                }}"""
+            )
+            state = json.loads(
+                await page.evaluate(
+                    f"""() => JSON.stringify({{
+                        value: document.querySelector({query_selector})?.value ?? null,
+                        searchDisabled: document.querySelector({search_selector})?.disabled ?? null,
+                    }})"""
+                )
+            )
             if state["value"] == phrase and state["searchDisabled"] is False:
                 matched = True
                 break
         if not matched:
             raise PhraseEntryError(
-                f"Wordstat search field state {state!r} after {max_attempts} attempts, expected {phrase!r}"
+                f"Wordstat search field state {state!r} after {max_attempts} attempts, "
+                f"attempt states: {attempt_states!r}, expected {phrase!r}"
             )
 
         await self._click(page, SEARCH_SELECTOR)
