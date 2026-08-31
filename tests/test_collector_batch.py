@@ -598,6 +598,35 @@ def test_collect_one_does_not_swallow_non_timeout_top_retry_error(monkeypatch, t
         )
 
 
+def test_collect_one_does_not_swallow_ambiguous_top_retry_timeout(monkeypatch, tmp_path):
+    """A multi-download timeout is not the recoverable no-new-path signal."""
+
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    async def fake_download(self, page, session, dl_path):
+        source = dl_path / "export.csv"
+        if source.exists():
+            raise DownloadTimeoutError("Wordstat produced more than one new CSV for a single export")
+        _write_empty_view_csv(source)
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+    with pytest.raises(DownloadTimeoutError, match="more than one new CSV"):
+        asyncio.run(
+            collector._collect_one(
+                _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
+            )
+        )
+
+
 def test_collect_one_does_not_swallow_dynamics_retry_timeout(monkeypatch, tmp_path):
     """An empty dynamics retry timeout must preserve fail-closed behavior."""
 
