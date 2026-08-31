@@ -570,52 +570,42 @@ class WordstatCollector:
                 manifest_path=manifest_path,
                 manifest=manifest,
             )
-        # The preceding complete view loop ends on REGIONS, whose map has no
-        # table. Keep the last table snapshot while a table view is visible
-        # so the next phrase gets the best-effort re-render nudge. Content
-        # equality is only evidence, never a gate: related phrases can
-        # legally have the same first row (or no row).
-        previous_table = self._previous_table_snapshot
-        self._previous_table_snapshot = None
-        await self._set_phrase(page, phrase)
-        if set_region:
-            # Only until region is actually applied — collect_many tracks
-            # that via on_region_applied, called right here, not by whether
-            # this whole method later returns successfully: a failure later
-            # in this same phrase (e.g. on its last view) must not make
-            # collect_many think the region still needs setting. The region
-            # control lives on the table/graph/associations tabs but not on
-            # the map tab (WordstatView.REGIONS) — and every phrase's view
-            # loop ends on the map, so calling this again for a later phrase
-            # that already has it applied would fail with
-            # InterfaceChangedError (confirmed live). It also isn't needed
-            # again once applied: Wordstat keeps `region=` in the URL across
-            # a phrase switch without re-selecting it (confirmed live too).
-            await self._set_region(page, region)
-            if on_region_applied is not None:
-                on_region_applied()
-        if previous_table is not None:
-            await self._wait_for(
-                page,
-                f"() => document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.textContent"
-                f" !== {json.dumps(previous_table)}",
-                seconds=3.0,
-                required=False,
-            )
-
-        # Capture provenance only after the requested phrase and region are
-        # applied. Before that point the URL still belongs to the previous
-        # phrase in a multi-phrase batch, or to the previous session when
-        # resuming. This is also the first successful write for a fresh run,
-        # so updated_at must advance beyond its creation timestamp. For a
-        # resume, created_at is deliberately left untouched: it marks when
-        # this run started, not when every view was collected, and its views
-        # can legitimately span more than one session.
-        manifest = manifest.model_copy(
-            update={"source_url": await page.get_url(), "updated_at": datetime.now(UTC)}
+        manifest = await self._prepare_phrase_context(
+            page, phrase, region, set_region, on_region_applied,
+            manifest, manifest_path,
         )
-        write_manifest(manifest_path, manifest)
 
+        manifest, view_errors, escaped_download_warnings, last_view_error = await self._collect_pending_views(
+            page, session, downloads_path, phrase, run_directory, manifest_path, manifest,
+            pending_views, granularity, date_from, date_to,
+        )
+
+        if last_view_error is not None and not manifest.exports:
+            # Nothing at all was collected for this phrase (the very first
+            # attempted view already failed, or a --resume-dir run whose
+            # only remaining view just failed too) — this must still surface
+            # as a failure, not a "partial success" CollectionResult with
+            # zero exports. Without this guard, collect_many would count a
+            # completely failed phrase in batch.results, and the CLI would
+            # report it as collected. Re-raises the original exception type/
+            # message (not a generic wrapper) so collect_many's per-phrase
+            # except still records the real cause in PhraseFailure.error.
+            raise last_view_error
+
+        return CollectionResult(
+            run_directory=run_directory,
+            manifest_path=manifest_path,
+            manifest=manifest,
+            view_errors=view_errors,
+            escaped_download_warnings=escaped_download_warnings,
+        )
+
+    async def _collect_pending_views(
+        self, page, session: BrowserSession, downloads_path: Path, phrase: str,
+        run_directory: Path, manifest_path: Path, manifest: CollectionManifest,
+        pending_views: list[WordstatView], granularity: Granularity,
+        date_from: date | None, date_to: date | None,
+    ) -> tuple[CollectionManifest, dict[WordstatView, str], list[str], Exception | None]:
         # issue #27: a failure on one view (e.g. the live escaped-download
         # race on regions, or any other InterfaceChangedError/parse failure)
         # used to propagate straight out of _collect_one, which collect_many
@@ -636,81 +626,15 @@ class WordstatCollector:
         last_view_error: Exception | None = None
         for view_index, view in enumerate(pending_views):
             try:
-                selector = VIEW_SELECTORS[view]
-                await self._select_view(page, selector, view)
-                # The live UI can expose the first table row before the export
-                # blob has been rebuilt for the selected phrase/view. A short
-                # settling interval prevents a header-only CSV from racing the
-                # table repaint; the structural row gate above remains required.
-                if view is not WordstatView.REGIONS and self.settling_seconds > 0:
-                    await asyncio.sleep(self.settling_seconds)
-                if view is WordstatView.DYNAMICS and (
-                    granularity is not Granularity.MONTHLY or date_from is not None
-                ):
-                    await self._set_granularity(page, granularity)
-                    if date_from is not None:
-                        await self._set_period(page, granularity, date_from, date_to)
-                source, escape_warning = await self._download_current_view(page, session, downloads_path)
+                source, dataset, escape_warning = await self._collect_view_export(
+                    page, session, downloads_path, run_directory, phrase, view,
+                    granularity, date_from, date_to,
+                )
                 if escape_warning is not None:
                     escaped_download_warnings.append(f"[{view.value}] {escape_warning}")
-                try:
-                    # Convert before disposing of the download, so a parse or
-                    # write failure leaves the raw CSV on disk to inspect. The
-                    # live export blob can lag the table repaint once. The
-                    # parsed CSV, not the already-passing DOM row gate, is the
-                    # signal used to trigger one retry. Top views can still be
-                    # legitimately empty after that retry, so this is kept
-                    # separate from the fail-closed predicate below.
-                    dataset = parse_wordstat_csv(source, view)
-                    _assert_export_phrase(dataset, phrase, view)
-                    if _should_retry_empty_export(view, dataset) or _is_untrustworthy_empty_export(view, dataset):
-                        retry = await self._retry_empty_export(
-                            page,
-                            session,
-                            downloads_path,
-                            source,
-                            dataset,
-                            view,
-                            escaped_download_warnings,
-                        )
-                        source, dataset = retry.source, retry.dataset
-                        _assert_export_phrase(dataset, phrase, view)
-                    if _is_untrustworthy_empty_export(view, dataset):
-                        raise InterfaceChangedError(
-                            f"Wordstat returned an empty {view.value} CSV after a retry, but the page had "
-                            "rendered at least one table row before the download was triggered; export is "
-                            "not trustworthy"
-                        )
-                    if view is WordstatView.DYNAMICS:
-                        self._assert_contiguous_dynamics_rows(
-                            dataset, granularity, date_from=date_from, date_to=date_to
-                        )
-                    file_name = self._dynamics_file_name(granularity) if view is WordstatView.DYNAMICS else None
-                    if file_name is None:
-                        data_path, dtypes = write_dataset(dataset, run_directory)
-                    else:
-                        data_path, dtypes = write_dataset(dataset, run_directory, file_name=file_name)
-                    raw_path = finalize_raw(
-                        source, run_directory, view, self.keep_raw, output_root=self.output_root
-                    )
-                except Exception:  # noqa: BLE001
-                    # source lives in the batch's shared, temporary downloads
-                    # directory; it would otherwise vanish with that directory
-                    # once the batch finishes. Rescue it into this phrase's own
-                    # run directory for any failure past this point (parsing,
-                    # dtype inference, the parquet write itself), not just
-                    # CsvFormatError, so "the CSV stays on disk to inspect" holds
-                    # regardless of which step failed.
-                    # shutil.move (not Path.replace/os.rename) so this survives
-                    # source and run_directory sitting on different filesystems —
-                    # same reasoning as finalize_raw's own move. source here is
-                    # always the file _download_current_view already confirmed
-                    # lives inside downloads_path (an escaped path raises
-                    # DownloadEscapedError before source is ever bound in this
-                    # scope), so no containment check is needed on this path.
-                    if source.exists():
-                        shutil.move(str(source), str(run_directory / source.name))
-                    raise
+                data_path, dtypes, raw_path = self._write_view_export(
+                    source, dataset, run_directory, view, granularity
+                )
                 if view != WordstatView.REGIONS:
                     self._previous_table_snapshot = await self._table_snapshot(page)
                 export = ExportSummary(
@@ -734,40 +658,99 @@ class WordstatCollector:
             except AuthenticationRequiredError:
                 raise
             except Exception as error:  # noqa: BLE001 - per-view isolation is intentional, see comment above
-                view_errors[view] = f"{type(error).__name__}: {error}"
+                self._record_view_failure(view_errors, pending_views, view_index, view, error)
                 last_view_error = error
-                # Every view after this one was never attempted at all (the
-                # loop breaks, see the comment above this loop) — record
-                # that explicitly instead of leaving them silently absent
-                # from both exports and view_errors. Without this, the CLI
-                # (which falls back to "не собран" for any view in
-                # missing_views with no view_errors entry) would print the
-                # same message for "we tried and it genuinely failed" and
-                # "we never even attempted this view", which reads as a
-                # false claim that every view was tried.
-                for skipped_view in pending_views[view_index + 1 :]:
-                    view_errors[skipped_view] = f"не пробовался: сбой на виде {view.value}"
                 break
 
-        if last_view_error is not None and not manifest.exports:
-            # Nothing at all was collected for this phrase (the very first
-            # attempted view already failed, or a --resume-dir run whose
-            # only remaining view just failed too) — this must still surface
-            # as a failure, not a "partial success" CollectionResult with
-            # zero exports. Without this guard, collect_many would count a
-            # completely failed phrase in batch.results, and the CLI would
-            # report it as collected. Re-raises the original exception type/
-            # message (not a generic wrapper) so collect_many's per-phrase
-            # except still records the real cause in PhraseFailure.error.
-            raise last_view_error
+        return manifest, view_errors, escaped_download_warnings, last_view_error
 
-        return CollectionResult(
-            run_directory=run_directory,
-            manifest_path=manifest_path,
-            manifest=manifest,
-            view_errors=view_errors,
-            escaped_download_warnings=escaped_download_warnings,
+    async def _prepare_phrase_context(
+        self, page, phrase: str, region: str, set_region: bool,
+        on_region_applied: Callable[[], None] | None,
+        manifest: CollectionManifest, manifest_path: Path,
+    ) -> CollectionManifest:
+        """Apply phrase context and persist provenance before view work."""
+        previous_table = self._previous_table_snapshot
+        self._previous_table_snapshot = None
+        await self._set_phrase(page, phrase)
+        if set_region:
+            await self._set_region(page, region)
+            if on_region_applied is not None:
+                on_region_applied()
+        if previous_table is not None:
+            await self._wait_for(
+                page,
+                f"() => document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.textContent"
+                f" !== {json.dumps(previous_table)}",
+                seconds=3.0,
+                required=False,
+            )
+        manifest = manifest.model_copy(
+            update={"source_url": await page.get_url(), "updated_at": datetime.now(UTC)}
         )
+        write_manifest(manifest_path, manifest)
+        return manifest
+
+    async def _collect_view_export(
+        self, page, session: BrowserSession, downloads_path: Path, run_directory: Path,
+        phrase: str, view: WordstatView, granularity: Granularity,
+        date_from: date | None, date_to: date | None,
+    ) -> tuple[Path, CsvDataset, str | None]:
+        """Select, download, parse, and validate one view's export."""
+        source: Path | None = None
+        try:
+            await self._select_view(page, VIEW_SELECTORS[view], view)
+            if view is not WordstatView.REGIONS and self.settling_seconds > 0:
+                await asyncio.sleep(self.settling_seconds)
+            if view is WordstatView.DYNAMICS and (
+                granularity is not Granularity.MONTHLY or date_from is not None
+            ):
+                await self._set_granularity(page, granularity)
+                if date_from is not None:
+                    await self._set_period(page, granularity, date_from, date_to)
+            source, warning = await self._download_current_view(page, session, downloads_path)
+            warnings = [warning] if warning is not None else []
+            dataset = parse_wordstat_csv(source, view)
+            _assert_export_phrase(dataset, phrase, view)
+            if _should_retry_empty_export(view, dataset) or _is_untrustworthy_empty_export(view, dataset):
+                retry = await self._retry_empty_export(
+                    page, session, downloads_path, source, dataset, view, warnings
+                )
+                source, dataset = retry.source, retry.dataset
+                _assert_export_phrase(dataset, phrase, view)
+            if _is_untrustworthy_empty_export(view, dataset):
+                raise InterfaceChangedError(
+                    f"Wordstat returned an empty {view.value} CSV after a retry, but the page had "
+                    "rendered at least one table row before the download was triggered; export is not trustworthy"
+                )
+            if view is WordstatView.DYNAMICS:
+                self._assert_contiguous_dynamics_rows(dataset, granularity, date_from=date_from, date_to=date_to)
+            return source, dataset, " ".join(warnings) or None
+        except Exception:
+            if source is not None and source.exists():
+                shutil.move(str(source), str(run_directory / source.name))
+            raise
+
+    def _write_view_export(
+        self, source: Path, dataset: CsvDataset, run_directory: Path,
+        view: WordstatView, granularity: Granularity,
+    ) -> tuple[Path, dict[str, str], Path | None]:
+        """Write parquet and finalize raw, rescuing source if either fails."""
+        try:
+            file_name = self._dynamics_file_name(granularity) if view is WordstatView.DYNAMICS else None
+            data_path, dtypes = write_dataset(dataset, run_directory, **({"file_name": file_name} if file_name else {}))
+            raw_path = finalize_raw(source, run_directory, view, self.keep_raw, output_root=self.output_root)
+            return data_path, dtypes, raw_path
+        except Exception:
+            if source.exists():
+                shutil.move(str(source), str(run_directory / source.name))
+            raise
+
+    @staticmethod
+    def _record_view_failure(errors, pending_views, index, view, error) -> None:
+        errors[view] = f"{type(error).__name__}: {error}"
+        for skipped_view in pending_views[index + 1 :]:
+            errors[skipped_view] = f"не пробовался: сбой на виде {view.value}"
 
     @staticmethod
     def _requested_period(date_from: date | None, date_to: date | None) -> dict[str, str] | None:
