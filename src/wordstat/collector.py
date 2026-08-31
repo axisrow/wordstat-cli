@@ -592,6 +592,18 @@ class WordstatCollector:
                     if _should_retry_empty_export(view, dataset) or _is_untrustworthy_empty_export(view, dataset):
                         if self.empty_export_retry_seconds > 0:
                             await asyncio.sleep(self.empty_export_retry_seconds)
+                        # The retry may reuse the same path and overwrite the
+                        # first file. Keep the original beside the temporary
+                        # downloads directory so a no-new-path fallback cannot
+                        # pair the old parsed dataset with new raw contents.
+                        with tempfile.NamedTemporaryFile(
+                            prefix=f".{view.value}-retry-",
+                            suffix=".csv",
+                            dir=self.output_root,
+                            delete=False,
+                        ) as backup_file:
+                            retry_backup = Path(backup_file.name)
+                        shutil.copy2(source, retry_backup)
                         try:
                             retry_source, retry_escape_warning = await self._download_current_view(
                                 page, session, downloads_path
@@ -606,11 +618,16 @@ class WordstatCollector:
                             # remaining views rather than failing the phrase.
                             if not _should_retry_empty_export(view, dataset):
                                 raise
+                            source = retry_backup
+                            retry_backup = None
                         else:
                             source = retry_source
                             if retry_escape_warning is not None:
                                 escaped_download_warnings.append(f"[{view.value}] {retry_escape_warning}")
                             dataset = parse_wordstat_csv(source, view)
+                        finally:
+                            if retry_backup is not None:
+                                retry_backup.unlink(missing_ok=True)
                     if _is_untrustworthy_empty_export(view, dataset):
                         raise InterfaceChangedError(
                             f"Wordstat returned an empty {view.value} CSV after a retry, but the page had "

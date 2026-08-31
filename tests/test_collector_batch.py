@@ -569,6 +569,48 @@ def test_collect_one_keeps_empty_top_export_when_retry_times_out(monkeypatch, tm
     assert result.manifest.empty_views == [WordstatView.TOP_POPULAR]
 
 
+def test_collect_one_preserves_first_csv_when_retry_overwrites_path(monkeypatch, tmp_path):
+    """Fallback parquet and raw CSV must describe the same first export."""
+
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    download_count = 0
+
+    async def fake_download(self, page, session, dl_path):
+        nonlocal download_count
+        download_count += 1
+        source = dl_path / "export.csv"
+        if download_count == 1:
+            _write_empty_view_csv(source)
+            return source, None
+        if download_count == 2:
+            _write_view_csv(source, "тест")
+            raise DownloadNoNewPathError("simulated overwritten-path timeout")
+        source = dl_path / f"export-{download_count}.csv"
+        _write_view_csv(source, "тест")
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector(
+        "cdp", tmp_path, keep_raw=True, settling_seconds=0, empty_export_retry_seconds=0
+    )
+    result = asyncio.run(
+        collector._collect_one(
+            _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
+        )
+    )
+
+    assert result.manifest.exports[0].row_count == 0
+    assert (result.run_directory / "top_popular.csv").read_text(encoding="cp1251") == "Запрос;Показов\n"
+
+
 def test_collect_one_does_not_swallow_non_timeout_top_retry_error(monkeypatch, tmp_path):
     """Only the known same-name timeout is recoverable for a top export."""
 
