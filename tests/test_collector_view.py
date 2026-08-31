@@ -56,6 +56,45 @@ def test_set_phrase_returns_to_table_before_subview_selection(monkeypatch, tmp_p
     assert any(VIEW_SELECTORS[WordstatView.TOP_POPULAR] in expression for expression in waits)
 
 
+def test_set_phrase_repairs_a_truncated_fill_with_controlled_input_events(monkeypatch, tmp_path):
+    fills = 0
+    repair_expression = None
+    state = {"value": "ки", "searchDisabled": False}
+
+    class Element:
+        async def fill(self, phrase):
+            nonlocal fills
+            fills += 1
+
+    class Page:
+        async def get_elements_by_css_selector(self, selector):
+            return [Element()]
+
+        async def evaluate(self, expression):
+            nonlocal repair_expression
+            if "Object.getOwnPropertyDescriptor" in expression:
+                repair_expression = expression
+                state.update(value="новогодние подарки", searchDisabled=False)
+            return json.dumps(state)
+
+    async def click(self, page, selector):
+        pass
+
+    async def wait(self, page, expression, seconds=None, required=True):
+        pass
+
+    monkeypatch.setattr(WordstatCollector, "_click", click)
+    monkeypatch.setattr(WordstatCollector, "_wait_for", wait)
+
+    asyncio.run(WordstatCollector("cdp", tmp_path)._set_phrase(Page(), "новогодние подарки"))
+
+    assert fills == 1
+    assert repair_expression is not None
+    assert "setter.call(input" in repair_expression
+    assert "new Event('input'" in repair_expression
+    assert "new Event('change'" in repair_expression
+
+
 @pytest.mark.parametrize(
     ("phrase", "header", "expected"),
     [
