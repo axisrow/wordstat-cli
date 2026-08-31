@@ -202,6 +202,17 @@ class _RetryExportResult:
     dataset: CsvDataset
 
 
+@dataclass(frozen=True)
+class _PreparedRun:
+    """The on-disk state and work still required for one collection run."""
+
+    run_directory: Path
+    manifest_path: Path
+    manifest: CollectionManifest
+    pending_views: list[WordstatView]
+    resumed: bool
+
+
 class WordstatCollector:
     """Export four Wordstat reports through an already authenticated CDP session."""
 
@@ -435,6 +446,70 @@ class WordstatCollector:
 
         return BatchCollectionResult(total=len(cleaned_phrases), results=results, failures=failures)
 
+    async def _prepare_run(
+        self,
+        page,
+        phrase: str,
+        region: str,
+        *,
+        resume_directory: Path | None,
+        granularity: Granularity,
+        date_from: date | None,
+        date_to: date | None,
+    ) -> _PreparedRun:
+        """Validate or create the run state before interacting with views."""
+        if resume_directory is not None:
+            # prepare_resume_directory is the hard reject against the main
+            # data-corruption risk here: it never reuses a directory whose
+            # stored phrase/region don't match this request. The storage
+            # helper also owns the manifest/file validation for resume.
+            run_directory = resume_directory
+            manifest = prepare_resume_directory(run_directory, phrase, region)
+            requested_period = self._requested_period(date_from, date_to)
+            if manifest.granularity is not granularity or manifest.requested_period != requested_period:
+                raise InvalidRequestError(
+                    "--resume-dir was created with a different dynamics granularity or requested period"
+                )
+            manifest_path = run_directory / "manifest.json"
+            pending_views = views_to_collect(run_directory, manifest)
+            # Do not rewrite a complete run: in particular, its source URL
+            # and updated_at describe the last actual collection write.
+            if not pending_views:
+                return _PreparedRun(run_directory, manifest_path, manifest, pending_views, resumed=True)
+
+            # Keep the manifest honest while a missing parquet is retried.
+            # views_to_collect() considers the file as well as the manifest
+            # entry, so remove stale entries before any later failure can
+            # leave them looking complete.
+            stale_pending = {view for view in pending_views if any(e.view == view for e in manifest.exports)}
+            if stale_pending:
+                manifest = manifest.model_copy(
+                    update={
+                        "exports": [e for e in manifest.exports if e.view not in stale_pending],
+                        "updated_at": datetime.now(UTC),
+                    }
+                )
+                write_manifest(manifest_path, manifest)
+            return _PreparedRun(run_directory, manifest_path, manifest, pending_views, resumed=True)
+
+        run_directory = create_run_directory(self.output_root, phrase)
+        manifest_path = run_directory / "manifest.json"
+        # Write the empty manifest before the first view starts, so an
+        # interruption still leaves a resumable run on disk.
+        start = datetime.now(UTC)
+        manifest = CollectionManifest(
+            phrase=phrase,
+            region=region,
+            created_at=start,
+            updated_at=start,
+            source_url=await page.get_url(),
+            exports=[],
+            granularity=granularity,
+            requested_period=self._requested_period(date_from, date_to),
+        )
+        write_manifest(manifest_path, manifest)
+        return _PreparedRun(run_directory, manifest_path, manifest, list(WordstatView), resumed=False)
+
     async def _collect_one(
         self,
         page,
@@ -455,60 +530,25 @@ class WordstatCollector:
         # instead of a confusing InterfaceChangedError from a control that
         # silently stopped working.
         await self._assert_authenticated(page)
-
-        if resume_directory is not None:
-            # prepare_resume_directory is the hard reject against the main
-            # data-corruption risk here: it never reuses a directory whose
-            # stored phrase/region don't match this request. create_run_directory's
-            # own never-overwrite guarantee is untouched — resuming is this
-            # separate, explicit path, not a fallback baked into it.
-            run_directory = resume_directory
-            manifest = prepare_resume_directory(run_directory, phrase, region)
-            requested_period = self._requested_period(date_from, date_to)
-            if manifest.granularity is not granularity or manifest.requested_period != requested_period:
-                raise InvalidRequestError(
-                    "--resume-dir was created with a different dynamics granularity or requested period"
-                )
-            manifest_path = run_directory / "manifest.json"
-            pending_views = views_to_collect(run_directory, manifest)
-            if not pending_views:
-                return CollectionResult(
-                    run_directory=run_directory,
-                    manifest_path=manifest_path,
-                    manifest=manifest,
-                )
-            # Cycle-review follow-up to issue #27: views_to_collect() treats a
-            # view as pending when its <view>.parquet is missing from disk,
-            # even if manifest.exports still has an ExportSummary for it (the
-            # file was manually deleted after a prior run, or a previous
-            # resume's write_manifest happened but the file write that should
-            # have preceded it did not — see write_dataset/finalize_raw
-            # ordering). Until this view is re-collected below, its stale
-            # export entry must not stay in manifest.exports: missing_views is
-            # a computed field derived only from exports (see
-            # CollectionManifest), so an unpruned stale entry makes
-            # missing_views silently omit a view whose data file does not
-            # exist. Pruned *before* the loop attempts to re-collect it (not
-            # only on a failed retry) so a crash/Ctrl-C mid-retry still leaves
-            # an honest manifest, consistent with this method's existing
-            # "write after every step, never lie about what's on disk"
-            # invariant. A successful re-collection below overwrites this via
-            # merge_export as usual; nothing here disturbs a view that is not
-            # in pending_views.
-            stale_pending = {view for view in pending_views if any(e.view == view for e in manifest.exports)}
-            if stale_pending:
-                manifest = manifest.model_copy(
-                    update={
-                        "exports": [e for e in manifest.exports if e.view not in stale_pending],
-                        "updated_at": datetime.now(UTC),
-                    }
-                )
-                write_manifest(manifest_path, manifest)
-        else:
-            run_directory = create_run_directory(self.output_root, phrase)
-            manifest = None
-            manifest_path = run_directory / "manifest.json"
-            pending_views = list(WordstatView)
+        prepared = await self._prepare_run(
+            page,
+            phrase,
+            region,
+            resume_directory=resume_directory,
+            granularity=granularity,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        run_directory = prepared.run_directory
+        manifest_path = prepared.manifest_path
+        manifest = prepared.manifest
+        pending_views = prepared.pending_views
+        if not pending_views:
+            return CollectionResult(
+                run_directory=run_directory,
+                manifest_path=manifest_path,
+                manifest=manifest,
+            )
         # The preceding complete view loop ends on REGIONS, whose map has no
         # table. Keep the last table snapshot while a table view is visible
         # so the next phrase gets the best-effort re-render nudge. Content
@@ -542,29 +582,7 @@ class WordstatCollector:
                 required=False,
             )
 
-        if manifest is None:
-            # Written once up front (exports=[], so missing_views/status are
-            # derived as every view missing / "incomplete") so a crash before
-            # the first view even finishes still leaves a manifest.json on
-            # disk describing an empty-but-started run, instead of nothing.
-            # updated_at is set here too (equal to created_at for this first
-            # write): leaving it null would make null ambiguous between "a
-            # successful write already happened" and "this manifest predates
-            # the updated_at field" — see CollectionManifest's docstring,
-            # which promises null means only the latter.
-            start = datetime.now(UTC)
-            manifest = CollectionManifest(
-                phrase=phrase,
-                region=region,
-                created_at=start,
-                updated_at=start,
-                source_url=await page.get_url(),
-                exports=[],
-                granularity=granularity,
-                requested_period=self._requested_period(date_from, date_to),
-            )
-            write_manifest(manifest_path, manifest)
-        else:
+        if prepared.resumed:
             # Resuming: source_url must not silently keep pointing at
             # whatever tab/phrase the *previous* session ended on — it is
             # only accurate as of the last successful write (see
