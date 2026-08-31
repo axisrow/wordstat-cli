@@ -1556,13 +1556,24 @@ def test_collect_one_fresh_manifest_uses_url_after_phrase_setup(monkeypatch, tmp
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
     monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
 
+    written_manifests = []
+    real_write_manifest = collector_module.write_manifest
+
+    def recording_write_manifest(path, manifest):
+        written_manifests.append(manifest)
+        real_write_manifest(path, manifest)
+
+    monkeypatch.setattr(collector_module, "write_manifest", recording_write_manifest)
     collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
     page = _FakePage(url="https://wordstat.yandex.ru/?words=предыдущая&region=Россия")
     result = asyncio.run(collector._collect_one(page, _FakeSession(), downloads_path, "тест", "Россия"))
 
     expected_url = "https://wordstat.yandex.ru/?words=тест&region=Россия"
     assert result.manifest.source_url == expected_url
+    assert result.manifest.updated_at > result.manifest.created_at
+    assert written_manifests[0].updated_at > written_manifests[0].created_at
     assert load_manifest(result.manifest_path).source_url == expected_url
+    assert load_manifest(result.manifest_path).updated_at == result.manifest.updated_at
 
 
 def test_collect_one_resume_updates_source_url_and_updated_at_but_not_created_at(monkeypatch, tmp_path):

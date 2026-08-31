@@ -596,7 +596,9 @@ class WordstatCollector:
             # Capture provenance only after the requested phrase and region
             # are applied. Before that point the URL still belongs to the
             # previous phrase in a multi-phrase batch.
-            manifest = manifest.model_copy(update={"source_url": await page.get_url()})
+            manifest = manifest.model_copy(
+                update={"source_url": await page.get_url(), "updated_at": datetime.now(UTC)}
+            )
             write_manifest(manifest_path, manifest)
 
         # issue #27: a failure on one view (e.g. the live escaped-download
