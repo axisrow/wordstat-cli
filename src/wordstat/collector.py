@@ -494,8 +494,6 @@ class WordstatCollector:
 
         run_directory = create_run_directory(self.output_root, phrase)
         manifest_path = run_directory / "manifest.json"
-        # Write the empty manifest before the first view starts, so an
-        # interruption still leaves a resumable run on disk.
         start = datetime.now(UTC)
         manifest = CollectionManifest(
             phrase=phrase,
@@ -507,7 +505,6 @@ class WordstatCollector:
             granularity=granularity,
             requested_period=self._requested_period(date_from, date_to),
         )
-        write_manifest(manifest_path, manifest)
         return _PreparedRun(run_directory, manifest_path, manifest, list(WordstatView), resumed=False)
 
     async def _collect_one(
@@ -594,6 +591,12 @@ class WordstatCollector:
             # page is still on the previous phrase/tab until _set_phrase
             # returns.
             manifest = manifest.model_copy(update={"source_url": await page.get_url(), "updated_at": datetime.now(UTC)})
+            write_manifest(manifest_path, manifest)
+        else:
+            # Capture provenance only after the requested phrase and region
+            # are applied. Before that point the URL still belongs to the
+            # previous phrase in a multi-phrase batch.
+            manifest = manifest.model_copy(update={"source_url": await page.get_url()})
             write_manifest(manifest_path, manifest)
 
         # issue #27: a failure on one view (e.g. the live escaped-download
