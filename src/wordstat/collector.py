@@ -17,6 +17,7 @@ from wordstat.dataset_io import write_dataset
 from wordstat.errors import (
     AuthenticationRequiredError,
     DownloadEscapedError,
+    DownloadNoNewPathError,
     DownloadTimeoutError,
     InterfaceChangedError,
     InvalidRequestError,
@@ -595,7 +596,7 @@ class WordstatCollector:
                             retry_source, retry_escape_warning = await self._download_current_view(
                                 page, session, downloads_path
                             )
-                        except DownloadTimeoutError:
+                        except DownloadNoNewPathError:
                             # A repeated export can overwrite the original CSV
                             # instead of creating a new path. In that case the
                             # snapshot-based download wait times out even
@@ -1294,7 +1295,7 @@ class WordstatCollector:
                     "automatically. Move it manually if it belongs to this run."
                 )
             await asyncio.sleep(0.25)
-        raise DownloadTimeoutError("Wordstat did not produce a CSV before the download timeout")
+        raise DownloadNoNewPathError("Wordstat did not produce a new CSV before the download timeout")
 
     async def _click(self, page, selector: str) -> None:
         result = await page.evaluate(

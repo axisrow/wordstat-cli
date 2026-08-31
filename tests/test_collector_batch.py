@@ -15,6 +15,7 @@ import wordstat.collector as collector_module
 from wordstat.collector import WordstatCollector
 from wordstat.errors import (
     AuthenticationRequiredError,
+    DownloadNoNewPathError,
     DownloadTimeoutError,
     InterfaceChangedError,
     InvalidRequestError,
@@ -547,7 +548,7 @@ def test_collect_one_keeps_empty_top_export_when_retry_times_out(monkeypatch, tm
             _write_empty_view_csv(source)
             return source, None
         if download_count == 2:
-            raise DownloadTimeoutError("simulated same-name retry timeout")
+            raise DownloadNoNewPathError("simulated same-name retry timeout")
         source = dl_path / f"export-{download_count}.csv"
         _write_view_csv(source, "тест")
         return source, None
@@ -617,7 +618,7 @@ def test_collect_one_does_not_swallow_dynamics_retry_timeout(monkeypatch, tmp_pa
             _write_empty_view_csv(source)
             return source, None
         if download_count == 4:
-            raise DownloadTimeoutError("simulated dynamics retry timeout")
+            raise DownloadNoNewPathError("simulated dynamics retry timeout")
         _write_view_csv(source, "тест")
         return source, None
 
@@ -635,7 +636,7 @@ def test_collect_one_does_not_swallow_dynamics_retry_timeout(monkeypatch, tmp_pa
     assert result.manifest.exports[0].view is WordstatView.TOP_POPULAR
     assert result.manifest.exports[1].view is WordstatView.TOP_RELATED
     assert result.view_errors[WordstatView.DYNAMICS] == (
-        "DownloadTimeoutError: simulated dynamics retry timeout"
+        "DownloadNoNewPathError: simulated dynamics retry timeout"
     )
 
 
