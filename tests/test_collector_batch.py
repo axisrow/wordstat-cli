@@ -475,6 +475,7 @@ def test_collect_one_retries_empty_table_exports_using_csv_content(monkeypatch, 
     assert download_count == 6  # top views each needed one content-based retry
     assert {export.view for export in result.manifest.exports} == set(WordstatView)
     assert all(export.row_count == 1 for export in result.manifest.exports)
+    assert not list(tmp_path.glob("*retry*"))
 
 
 def test_collect_one_accepts_persistent_empty_top_exports_after_retry(monkeypatch, tmp_path):
