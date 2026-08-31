@@ -9,6 +9,7 @@ whole method.
 import asyncio
 from datetime import UTC, datetime
 
+import pyarrow.parquet as parquet
 import pytest
 
 import wordstat.collector as collector_module
@@ -465,7 +466,9 @@ def test_collect_one_retries_empty_table_exports_using_csv_content(monkeypatch, 
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
     monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
 
-    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+    collector = WordstatCollector(
+        "cdp", tmp_path, keep_raw=True, settling_seconds=0, empty_export_retry_seconds=0
+    )
     result = asyncio.run(
         collector._collect_one(
             _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
@@ -476,6 +479,10 @@ def test_collect_one_retries_empty_table_exports_using_csv_content(monkeypatch, 
     assert {export.view for export in result.manifest.exports} == set(WordstatView)
     assert all(export.row_count == 1 for export in result.manifest.exports)
     assert not list(tmp_path.glob("*retry*"))
+    top_export = next(export for export in result.manifest.exports if export.view is WordstatView.TOP_POPULAR)
+    assert top_export.raw_file == "top_popular.csv"
+    assert "январь 2024;100" in (result.run_directory / top_export.raw_file).read_text(encoding="cp1251")
+    assert parquet.read_table(result.run_directory / top_export.file).num_rows == top_export.row_count
 
 
 def test_collect_one_accepts_persistent_empty_top_exports_after_retry(monkeypatch, tmp_path):
