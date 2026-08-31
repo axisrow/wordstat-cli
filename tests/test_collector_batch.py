@@ -7,7 +7,7 @@ whole method.
 """
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pyarrow.parquet as parquet
 import pytest
@@ -24,7 +24,8 @@ from wordstat.errors import (
     ResumeMismatchError,
 )
 from wordstat.models import CollectionManifest, CollectionResult, WordstatView
-from wordstat.storage import load_manifest
+from wordstat.periods import Granularity
+from wordstat.storage import load_manifest, write_manifest
 
 
 def _fake_result(tmp_path, phrase) -> CollectionResult:
@@ -374,6 +375,18 @@ def test_collect_many_keeps_results_when_session_stop_raises(monkeypatch, tmp_pa
     batch = asyncio.run(collector.collect_many(["чай"]))
 
     assert [r.run_directory.name for r in batch.results] == ["чай"]
+
+
+def test_collect_phrase_with_policy_does_not_catch_base_exception(tmp_path):
+    """Control-flow exceptions such as KeyboardInterrupt must propagate."""
+
+    async def interrupt():
+        raise KeyboardInterrupt
+
+    collector = WordstatCollector("cdp", output_root=tmp_path)
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(collector._collect_phrase_with_policy("тест", interrupt))
 
 
 def test_collect_many_rejects_an_empty_phrase_list(tmp_path):
@@ -1515,6 +1528,64 @@ def test_collect_one_resume_directory_rejects_a_different_phrase(monkeypatch, tm
             )
 
     asyncio.run(run_resume_with_wrong_phrase())
+
+
+def _write_resume_manifest(
+    run_directory, *, granularity=Granularity.MONTHLY, requested_period=None
+):
+    run_directory.mkdir()
+    write_manifest(
+        run_directory / "manifest.json",
+        CollectionManifest(
+            phrase="тест",
+            region="Россия",
+            created_at=datetime(2026, 8, 20, 12, 0, tzinfo=UTC),
+            updated_at=datetime(2026, 8, 20, 12, 1, tzinfo=UTC),
+            source_url="https://wordstat.yandex.ru/?words=тест",
+            exports=[],
+            granularity=granularity,
+            requested_period=requested_period,
+        ),
+    )
+
+
+def test_collect_one_resume_rejects_a_different_granularity(monkeypatch, tmp_path):
+    _patch_common(monkeypatch)
+    run_directory = tmp_path / "resume"
+    _write_resume_manifest(run_directory, granularity=Granularity.DAILY)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+
+    async def run_resume():
+        with pytest.raises(InvalidRequestError, match="different dynamics granularity or requested period"):
+            await collector._collect_one(
+                _FakePage(), _FakeSession(), tmp_path / "downloads", "тест", "Россия",
+                resume_directory=run_directory,
+            )
+
+    asyncio.run(run_resume())
+
+
+def test_collect_one_resume_rejects_a_different_requested_period(monkeypatch, tmp_path):
+    _patch_common(monkeypatch)
+    run_directory = tmp_path / "resume"
+    _write_resume_manifest(
+        run_directory,
+        requested_period={"from": "2026-01-01", "to": "2026-03-31"},
+    )
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+
+    async def run_resume():
+        with pytest.raises(InvalidRequestError, match="different dynamics granularity or requested period"):
+            await collector._collect_one(
+                _FakePage(), _FakeSession(), tmp_path / "downloads", "тест", "Россия",
+                resume_directory=run_directory,
+                date_from=date(2026, 2, 1),
+                date_to=date(2026, 4, 30),
+            )
+
+    asyncio.run(run_resume())
 
 
 def test_collect_many_rejects_resume_directory_with_more_than_one_phrase(tmp_path):
