@@ -1647,6 +1647,54 @@ def test_collect_one_resume_updates_source_url_and_updated_at_but_not_created_at
     assert on_disk.source_url == resumed_url
 
 
+def test_collect_one_resume_updates_timestamp_before_a_failed_view(monkeypatch, tmp_path):
+    """A resume write must advance updated_at even if its first view fails."""
+
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    first_call = True
+
+    async def first_pass_download(self, page, session, dl_path):
+        nonlocal first_call
+        if not first_call:
+            raise RuntimeError("simulated interruption")
+        first_call = False
+        source = dl_path / "export.csv"
+        _write_view_csv(source, "тест")
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", first_pass_download)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+
+    page = _FakePage(url="https://wordstat.yandex.ru/?words=тест&region=Россия")
+    first_result = asyncio.run(collector._collect_one(page, _FakeSession(), downloads_path, "тест", "Россия"))
+    original_updated_at = first_result.manifest.updated_at
+
+    async def failing_resume_download(self, page, session, dl_path):
+        raise RuntimeError("simulated resume failure")
+
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", failing_resume_download)
+    resumed_result = asyncio.run(
+        collector._collect_one(
+            page,
+            _FakeSession(),
+            downloads_path,
+            "тест",
+            "Россия",
+            resume_directory=first_result.run_directory,
+        )
+    )
+
+    assert resumed_result.manifest.updated_at > original_updated_at
+    assert load_manifest(resumed_result.manifest_path).updated_at == resumed_result.manifest.updated_at
+
+
 def test_collect_one_resume_of_an_already_complete_run_does_not_touch_the_manifest(monkeypatch, tmp_path):
     """A resume that finds nothing missing (the early return in
     _collect_one) must not bump updated_at or rewrite source_url — nothing
