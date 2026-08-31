@@ -6,7 +6,7 @@ import re
 import shutil
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -212,6 +212,15 @@ class _PreparedRun:
     pending_views: list[WordstatView]
 
 
+@dataclass(frozen=True)
+class _PhraseAttempt:
+    """Outcome of applying the batch's per-phrase error policy."""
+
+    continue_batch: bool
+    result: CollectionResult | None = None
+    failure: PhraseFailure | None = None
+
+
 class WordstatCollector:
     """Export four Wordstat reports through an already authenticated CDP session."""
 
@@ -324,9 +333,29 @@ class WordstatCollector:
         if resume_directory is not None and len(cleaned_phrases) != 1:
             raise InvalidRequestError("--resume-dir requires exactly one phrase")
 
-        results: list[CollectionResult] = []
-        failures: list[PhraseFailure] = []
+        # Resource ownership and the phrase loop intentionally live in separate
+        # helpers.  In particular, a failure in one phrase must not be able to
+        # accidentally widen the lifetime of the shared download directory or
+        # browser session.
+        return await self._run_batch_session(
+            cleaned_phrases,
+            region,
+            resume_directory,
+            granularity,
+            date_from,
+            date_to,
+        )
 
+    async def _run_batch_session(
+        self,
+        phrases: list[str],
+        region: str,
+        resume_directory: Path | None,
+        granularity: Granularity,
+        date_from: date | None,
+        date_to: date | None,
+    ) -> BatchCollectionResult:
+        """Own the batch's temporary downloads directory and browser session."""
         # create_run_directory() used to be the first thing that created
         # output_root (via mkdir(parents=True)). The shared downloads
         # directory below is now created before any run directory, so
@@ -334,14 +363,8 @@ class WordstatCollector:
         # a bare FileNotFoundError instead of a WordstatError.
         self.output_root.mkdir(parents=True, exist_ok=True)
 
-        # One downloads directory for the whole batch: BrowserSession fixes
-        # downloads_path at construction time, but each phrase needs its own
-        # run directory (built from its own slug). Downloads land in this
-        # shared holding area and are moved into the per-phrase run directory
-        # as they are converted; nothing is left behind in it once this `with`
-        # exits, because finalize_raw/parquet writing always relocates or
-        # deletes the file — and the failure path in _collect_one rescues it
-        # into the run directory first for any exception, not just success.
+        # BrowserSession fixes downloads_path at construction time, so one
+        # holding area is shared by all phrases and removed after the batch.
         with tempfile.TemporaryDirectory(dir=self.output_root, prefix=".downloads-") as downloads_dir:
             downloads_path = Path(downloads_dir)
             session = BrowserSession(
@@ -360,64 +383,10 @@ class WordstatCollector:
                 await session.start()
                 page = await session.new_page()
                 await page.goto(WORDSTAT_URL)
-                await self._wait_for(page, f"() => Boolean(document.querySelector({json.dumps(QUERY_SELECTOR)}))")
-                await self._assert_authenticated(page)
-
-                # Tracks whether the region has actually been applied in the
-                # browser — set by _collect_one's on_region_applied callback
-                # right after _set_region succeeds, not after the whole
-                # phrase (_collect_one) returns. A phrase can apply the
-                # region fine and then still fail later (e.g. on its last
-                # view, the map tab) — if region_ready were only set on a
-                # clean return, the next phrase would retry _set_region on a
-                # page already parked on the map, where the region control is
-                # absent from the DOM, and cascade InterfaceChangedError
-                # through the rest of the batch (Codex + /review finding,
-                # PR #5 round 2).
-                region_ready = False
-
-                def _mark_region_ready() -> None:
-                    nonlocal region_ready
-                    region_ready = True
-
-                for phrase in cleaned_phrases:
-                    try:
-                        # set_region: only until region_ready flips — see
-                        # _collect_one for why the region control can't be
-                        # re-selected once a phrase's view loop has run (and
-                        # doesn't need to be after that).
-                        collect_kwargs = {
-                            "set_region": not region_ready,
-                            "on_region_applied": _mark_region_ready,
-                            "resume_directory": resume_directory,
-                        }
-                        # Keep the historical call shape for the default
-                        # monthly path; several integrations monkeypatch this
-                        # seam and default behavior must remain unchanged.
-                        if granularity is not Granularity.MONTHLY or date_from is not None:
-                            collect_kwargs.update(
-                                granularity=granularity,
-                                date_from=date_from,
-                                date_to=date_to,
-                            )
-                        result = await self._collect_one(
-                            page, session, downloads_path, phrase, region, **collect_kwargs
-                        )
-                        results.append(result)
-                    except AuthenticationRequiredError as error:
-                        # The session itself is gone: every remaining phrase
-                        # would fail the same way, so stop instead of piling
-                        # up identical failures. Must be caught before the
-                        # generic Exception branch below.
-                        failures.append(PhraseFailure(phrase=phrase, error=_without_traceback(error)))
-                        break
-                    except Exception as error:  # noqa: BLE001 - batch isolation is intentional
-                        # Anything else (InterfaceChangedError, a pyarrow
-                        # error from write_dataset, a dropped CDP connection
-                        # for this one phrase, ...) must not take down the
-                        # rest of the batch. BaseException (KeyboardInterrupt,
-                        # SystemExit) deliberately still propagates.
-                        failures.append(PhraseFailure(phrase=phrase, error=_without_traceback(error)))
+                batch = await self._collect_batch_phrases(
+                    page, session, downloads_path, phrases, region, resume_directory,
+                    granularity, date_from, date_to,
+                )
             finally:
                 # Close only the tab this batch created (issue #9): new_page()
                 # above opens exactly one tab for the whole batch (not one per
@@ -443,7 +412,63 @@ class WordstatCollector:
                     # already collected below.
                     pass
 
-        return BatchCollectionResult(total=len(cleaned_phrases), results=results, failures=failures)
+        return batch
+
+    async def _collect_batch_phrases(
+        self, page, session, downloads_path: Path, phrases: list[str], region: str,
+        resume_directory: Path | None, granularity: Granularity, date_from: date | None,
+        date_to: date | None,
+    ) -> BatchCollectionResult:
+        """Authenticate once, then traverse phrases while retaining region state."""
+        await self._wait_for(page, f"() => Boolean(document.querySelector({json.dumps(QUERY_SELECTOR)}))")
+        await self._assert_authenticated(page)
+        results: list[CollectionResult] = []
+        failures: list[PhraseFailure] = []
+        region_ready = False
+
+        def mark_region_ready() -> None:
+            nonlocal region_ready
+            region_ready = True
+
+        for phrase in phrases:
+            collect_kwargs = {
+                "set_region": not region_ready,
+                "on_region_applied": mark_region_ready,
+                "resume_directory": resume_directory,
+            }
+            if granularity is not Granularity.MONTHLY or date_from is not None:
+                collect_kwargs.update(granularity=granularity, date_from=date_from, date_to=date_to)
+            attempt = await self._collect_phrase_with_policy(
+                phrase,
+                lambda: self._collect_one(page, session, downloads_path, phrase, region, **collect_kwargs),
+            )
+            if attempt.result is not None:
+                results.append(attempt.result)
+            else:
+                assert attempt.failure is not None
+                failures.append(attempt.failure)
+            if not attempt.continue_batch:
+                break
+        return BatchCollectionResult(total=len(phrases), results=results, failures=failures)
+
+    async def _collect_phrase_with_policy(
+        self, phrase: str, collect: Callable[[], Awaitable[CollectionResult]]
+    ) -> _PhraseAttempt:
+        """Apply batch error policy; BaseException intentionally is not caught."""
+        try:
+            return _PhraseAttempt(continue_batch=True, result=await collect(), failure=None)
+        except AuthenticationRequiredError as error:
+            return _PhraseAttempt(
+                continue_batch=False,
+                result=None,
+                failure=PhraseFailure(phrase=phrase, error=_without_traceback(error)),
+            )
+        except Exception as error:  # noqa: BLE001 - batch isolation is intentional
+            return _PhraseAttempt(
+                continue_batch=True,
+                result=None,
+                failure=PhraseFailure(phrase=phrase, error=_without_traceback(error)),
+            )
 
     async def _prepare_run(
         self,
