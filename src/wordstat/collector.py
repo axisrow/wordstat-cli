@@ -48,6 +48,7 @@ QUERY_SELECTOR = 'input[placeholder="Введите слово или слово
 SEARCH_SELECTOR = ".wordstat__search-button"
 DOWNLOAD_SELECTOR = "button.save-button"
 DOWNLOAD_CSV_MENU_ITEM_SELECTOR = "a[download]:has(button.save-csv-button)"
+TABLE_VIEW_SELECTOR = "label[for='table']"
 GRANULARITY_SELECTOR = ".wordstat__content-type_select > button"
 DATE_RANGE_SELECTOR = ".range-datepicker__selected-dates > button"
 REGION_BUTTON_SELECTOR = ".settings__selected button"
@@ -55,11 +56,36 @@ TABLE_ROW_SELECTOR = ".table__wrapper tbody tr"
 # Tab selectors live here with the rest of the DOM knowledge; the markup is
 # inconsistent enough (id- vs for-based) that it is worth having in one place.
 VIEW_SELECTORS = {
-    WordstatView.TOP_POPULAR: "label[for='table']",
+    WordstatView.TOP_POPULAR: "label:has(#popular)",
     WordstatView.TOP_RELATED: "label:has(#associations)",
     WordstatView.DYNAMICS: "label[for='graph']",
     WordstatView.REGIONS: "label[for='map']",
 }
+
+_QUOTED_PHRASE_MARKERS = (("«", "»"), ('"', '"'), ("“", "”"), ("„", "“"))
+
+
+def _assert_export_phrase(dataset: CsvDataset, phrase: str, view: WordstatView) -> None:
+    """Reject a CSV whose metadata identifies a different search phrase.
+
+    Wordstat's localized metadata wording is not a contract, but the query
+    itself is embedded as a quoted value in the report header.  Check that
+    stable identity rather than matching the surrounding localized prose.
+    Two-column synthetic/legacy exports have no metadata field and remain
+    accepted for backwards compatibility; live Wordstat exports have three
+    or more columns.
+    """
+    if len(dataset.headers) < 3:
+        return
+    if any(
+        f"{opening}{phrase}{closing}" in header
+        for header in dataset.headers
+        for opening, closing in _QUOTED_PHRASE_MARKERS
+    ):
+        return
+    raise InterfaceChangedError(
+        f"Wordstat {view.value} CSV metadata does not identify the requested phrase {phrase!r}"
+    )
 # The live interface is Russian; map explicitly rather than depending on the
 # host locale. Shared by every place that needs a Russian month name (the
 # calendar popups and the applied-period wait below), so there is exactly
@@ -598,6 +624,7 @@ class WordstatCollector:
                     # legitimately empty after that retry, so this is kept
                     # separate from the fail-closed predicate below.
                     dataset = parse_wordstat_csv(source, view)
+                    _assert_export_phrase(dataset, phrase, view)
                     if _should_retry_empty_export(view, dataset) or _is_untrustworthy_empty_export(view, dataset):
                         retry = await self._retry_empty_export(
                             page,
@@ -609,6 +636,7 @@ class WordstatCollector:
                             escaped_download_warnings,
                         )
                         source, dataset = retry.source, retry.dataset
+                        _assert_export_phrase(dataset, phrase, view)
                     if _is_untrustworthy_empty_export(view, dataset):
                         raise InterfaceChangedError(
                             f"Wordstat returned an empty {view.value} CSV after a retry, but the page had "
@@ -1099,6 +1127,14 @@ class WordstatCollector:
             page,
             f"""() => new URL(location.href).searchParams.get('words') === {expected_phrase}
                 && Boolean(document.querySelector({download_selector}))""",
+        )
+        # A phrase switch preserves the previously selected top-level view.
+        # Return to the table view before selecting a top-level subview; on
+        # the map, the popular/related radio controls are not in the DOM.
+        await self._click(page, TABLE_VIEW_SELECTOR)
+        await self._wait_for(
+            page,
+            f"() => document.querySelectorAll({json.dumps(VIEW_SELECTORS[WordstatView.TOP_POPULAR])}).length === 1",
         )
 
     async def _set_region(self, page, region: str) -> None:

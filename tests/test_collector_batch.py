@@ -485,6 +485,117 @@ def test_collect_one_retries_empty_table_exports_using_csv_content(monkeypatch, 
     assert parquet.read_table(result.run_directory / top_export.file).num_rows == top_export.row_count
 
 
+def test_collect_one_rejects_csv_for_a_different_phrase_before_writing(monkeypatch, tmp_path):
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    async def fake_download(self, page, session, dl_path):
+        source = dl_path / "export.csv"
+        source.write_text(
+            "Запросы со словами;Число запросов;Топ частотных запросов «другая фраза», Россия\n",
+            encoding="utf-8",
+        )
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path, keep_raw=True, settling_seconds=0, empty_export_retry_seconds=0)
+    with pytest.raises(InterfaceChangedError, match="does not identify"):
+        asyncio.run(
+            collector._collect_one(
+                _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
+            )
+        )
+
+    run_directories = list((tmp_path / "runs").iterdir())
+    assert len(run_directories) == 1
+    assert not list(run_directories[0].glob("*.parquet"))
+    assert list(run_directories[0].glob("*.csv"))
+
+
+def test_collect_one_rejects_different_phrase_after_empty_export_retry(monkeypatch, tmp_path):
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+    download_count = 0
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    async def fake_download(self, page, session, dl_path):
+        nonlocal download_count
+        download_count += 1
+        source = dl_path / f"export-{download_count}.csv"
+        phrase = "тест" if download_count == 1 else "другая фраза"
+        source.write_text(
+            f"Запросы со словами;Число запросов;Топ частотных запросов «{phrase}», Россия\n",
+            encoding="utf-8",
+        )
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path, keep_raw=True, settling_seconds=0, empty_export_retry_seconds=0)
+    with pytest.raises(InterfaceChangedError, match="does not identify"):
+        asyncio.run(
+            collector._collect_one(
+                _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
+            )
+        )
+
+    assert download_count == 2
+    run_directories = list((tmp_path / "runs").iterdir())
+    assert len(run_directories) == 1
+    assert not list(run_directories[0].glob("*.parquet"))
+    assert list(run_directories[0].glob("*.csv"))
+
+
+def test_collect_one_rejects_different_phrase_on_nonempty_dynamics_export(monkeypatch, tmp_path):
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+    download_count = 0
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    async def fake_download(self, page, session, dl_path):
+        nonlocal download_count
+        download_count += 1
+        source = dl_path / f"export-{download_count}.csv"
+        if download_count < 3:
+            _write_view_csv(source, "тест")
+        else:
+            source.write_text(
+                "Период;Число запросов;Доля от всех запросов, %;"
+                "Динамика частотности запросов «другая фраза», по месяцам\n"
+                "январь 2024;100;1;100\n",
+                encoding="utf-8",
+            )
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path, keep_raw=True, settling_seconds=0, empty_export_retry_seconds=0)
+    result = asyncio.run(
+        collector._collect_one(
+            _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
+        )
+    )
+
+    assert download_count == 3
+    assert "InterfaceChangedError" in result.view_errors[WordstatView.DYNAMICS]
+    assert not list(result.run_directory.glob("dynamics*.parquet"))
+    assert list(result.run_directory.glob("export-3.csv"))
+
+
 def test_collect_one_accepts_persistent_empty_top_exports_after_retry(monkeypatch, tmp_path):
     """Retrying top exports must not restore PR #25's fail-closed regression."""
 
