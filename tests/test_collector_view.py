@@ -7,10 +7,73 @@ from datetime import date
 
 import pytest
 
-from wordstat.collector import WordstatCollector, _is_untrustworthy_empty_export
+from wordstat.collector import (
+    SEARCH_SELECTOR,
+    TABLE_VIEW_SELECTOR,
+    VIEW_SELECTORS,
+    WordstatCollector,
+    _assert_export_phrase,
+    _is_untrustworthy_empty_export,
+)
 from wordstat.errors import InterfaceChangedError
 from wordstat.models import CsvDataset, WordstatView
 from wordstat.periods import Granularity
+
+
+def test_view_selectors_target_each_control_not_the_table_parent():
+    assert VIEW_SELECTORS[WordstatView.TOP_POPULAR] == "label:has(#popular)"
+    assert VIEW_SELECTORS[WordstatView.TOP_RELATED] == "label:has(#associations)"
+    assert "#table" not in VIEW_SELECTORS[WordstatView.TOP_POPULAR]
+
+
+def test_set_phrase_returns_to_table_before_subview_selection(monkeypatch, tmp_path):
+    clicks = []
+    waits = []
+
+    class Element:
+        async def fill(self, phrase):
+            pass
+
+    class Page:
+        async def get_elements_by_css_selector(self, selector):
+            return [Element()]
+
+        async def evaluate(self, expression):
+            return '{"value":"подарки","searchDisabled":false}'
+
+    async def click(self, page, selector):
+        clicks.append(selector)
+
+    async def wait(self, page, expression, seconds=None, required=True):
+        waits.append(expression)
+
+    monkeypatch.setattr(WordstatCollector, "_click", click)
+    monkeypatch.setattr(WordstatCollector, "_wait_for", wait)
+
+    asyncio.run(WordstatCollector("cdp", tmp_path)._set_phrase(Page(), "подарки"))
+
+    assert clicks == [SEARCH_SELECTOR, TABLE_VIEW_SELECTOR]
+    assert any(VIEW_SELECTORS[WordstatView.TOP_POPULAR] in expression for expression in waits)
+
+
+@pytest.mark.parametrize(
+    ("phrase", "header", "expected"),
+    [
+        ("подарки", "Топ частотных запросов «подарки», Россия", True),
+        ("подарки", "Запросы, похожие на «подарки», Россия", True),
+        ("подарки", "Запросы, похожие на «новогодние подарки», Россия", False),
+        ("подарки", "Top queries \"подарки\", Russia", True),
+        ("подарки", "Top queries подарки, Russia", False),
+    ],
+)
+def test_assert_export_phrase_uses_exact_quoted_phrase(phrase, header, expected):
+    dataset = _dataset(WordstatView.TOP_POPULAR, [])
+    dataset = dataset.model_copy(update={"headers": ["query", "count", header]})
+    if expected:
+        _assert_export_phrase(dataset, phrase, WordstatView.TOP_POPULAR)
+    else:
+        with pytest.raises(InterfaceChangedError, match="does not identify"):
+            _assert_export_phrase(dataset, phrase, WordstatView.TOP_POPULAR)
 
 
 def test_select_view_retries_once_when_active_marker_does_not_change(monkeypatch, tmp_path):
