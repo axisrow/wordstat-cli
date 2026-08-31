@@ -29,6 +29,14 @@ class DownloadTimeoutError(WordstatError):
     """The UI accepted an export request but did not produce a CSV file."""
 
 
+class DownloadNoNewPathError(DownloadTimeoutError):
+    """The export completed without exposing a new file path.
+
+    This is distinct from other download failures (notably multiple new CSVs)
+    because Chrome can handle a repeated export by reusing the existing path.
+    """
+
+
 class DownloadEscapedError(WordstatError):
     """Chrome reported a download outside the run's own downloads directory.
 

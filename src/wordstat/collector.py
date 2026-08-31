@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from wordstat.dataset_io import write_dataset
 from wordstat.errors import (
     AuthenticationRequiredError,
     DownloadEscapedError,
+    DownloadNoNewPathError,
     DownloadTimeoutError,
     InterfaceChangedError,
     InvalidRequestError,
@@ -164,6 +166,14 @@ def _without_traceback(error: Exception) -> Exception:
     the CLI finishes printing it).
     """
     return error.with_traceback(None)
+
+
+@dataclass(frozen=True)
+class _RetryExportResult:
+    """A parsed export whose path and contents are guaranteed to match."""
+
+    source: Path
+    dataset: CsvDataset
 
 
 class WordstatCollector:
@@ -589,12 +599,16 @@ class WordstatCollector:
                     # separate from the fail-closed predicate below.
                     dataset = parse_wordstat_csv(source, view)
                     if _should_retry_empty_export(view, dataset) or _is_untrustworthy_empty_export(view, dataset):
-                        if self.empty_export_retry_seconds > 0:
-                            await asyncio.sleep(self.empty_export_retry_seconds)
-                        source, escape_warning = await self._download_current_view(page, session, downloads_path)
-                        if escape_warning is not None:
-                            escaped_download_warnings.append(f"[{view.value}] {escape_warning}")
-                        dataset = parse_wordstat_csv(source, view)
+                        retry = await self._retry_empty_export(
+                            page,
+                            session,
+                            downloads_path,
+                            source,
+                            dataset,
+                            view,
+                            escaped_download_warnings,
+                        )
+                        source, dataset = retry.source, retry.dataset
                     if _is_untrustworthy_empty_export(view, dataset):
                         raise InterfaceChangedError(
                             f"Wordstat returned an empty {view.value} CSV after a retry, but the page had "
@@ -1181,6 +1195,55 @@ class WordstatCollector:
             f"() => document.querySelector({json.dumps(TABLE_ROW_SELECTOR)})?.textContent ?? null"
         )
 
+    async def _retry_empty_export(
+        self,
+        page,
+        session: BrowserSession,
+        downloads_path: Path,
+        source: Path,
+        dataset: CsvDataset,
+        view: WordstatView,
+        escaped_download_warnings: list[str],
+    ) -> _RetryExportResult:
+        """Retry an empty export and return a matching path/dataset pair.
+
+        A no-new-path timeout can mean Chrome reused and overwrote ``source``.
+        The original is backed up before the retry; on that specific signal,
+        restore it to the original path before returning. All other failures
+        propagate unchanged. The single outer ``finally`` owns the temporary
+        file through creation, copy, retry, restore, and cleanup.
+        """
+        if self.empty_export_retry_seconds > 0:
+            await asyncio.sleep(self.empty_export_retry_seconds)
+        retry_backup: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{view.value}-retry-",
+                suffix=".csv",
+                dir=self.output_root,
+                delete=False,
+            ) as backup_file:
+                retry_backup = Path(backup_file.name)
+            shutil.copy2(source, retry_backup)
+            try:
+                retry_source, retry_escape_warning = await self._download_current_view(
+                    page, session, downloads_path
+                )
+            except DownloadNoNewPathError:
+                if not _should_retry_empty_export(view, dataset):
+                    raise
+                shutil.copy2(retry_backup, source)
+                return _RetryExportResult(source=source, dataset=dataset)
+            if retry_escape_warning is not None:
+                escaped_download_warnings.append(f"[{view.value}] {retry_escape_warning}")
+            return _RetryExportResult(
+                source=retry_source,
+                dataset=parse_wordstat_csv(retry_source, view),
+            )
+        finally:
+            if retry_backup is not None:
+                retry_backup.unlink(missing_ok=True)
+
     async def _download_current_view(
         self, page, session: BrowserSession, downloads_path: Path
     ) -> tuple[Path, str | None]:
@@ -1279,7 +1342,7 @@ class WordstatCollector:
                     "automatically. Move it manually if it belongs to this run."
                 )
             await asyncio.sleep(0.25)
-        raise DownloadTimeoutError("Wordstat did not produce a CSV before the download timeout")
+        raise DownloadNoNewPathError("Wordstat did not produce a new CSV before the download timeout")
 
     async def _click(self, page, selector: str) -> None:
         result = await page.evaluate(

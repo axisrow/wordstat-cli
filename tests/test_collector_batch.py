@@ -9,13 +9,16 @@ whole method.
 import asyncio
 from datetime import UTC, datetime
 
+import pyarrow.parquet as parquet
 import pytest
 
 import wordstat.collector as collector_module
 from wordstat.collector import WordstatCollector
 from wordstat.errors import (
     AuthenticationRequiredError,
+    DownloadNoNewPathError,
     DownloadTimeoutError,
+    InterfaceChangedError,
     InvalidRequestError,
     PhraseEntryError,
     ResumeMismatchError,
@@ -463,7 +466,9 @@ def test_collect_one_retries_empty_table_exports_using_csv_content(monkeypatch, 
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
     monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
 
-    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+    collector = WordstatCollector(
+        "cdp", tmp_path, keep_raw=True, settling_seconds=0, empty_export_retry_seconds=0
+    )
     result = asyncio.run(
         collector._collect_one(
             _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
@@ -473,6 +478,11 @@ def test_collect_one_retries_empty_table_exports_using_csv_content(monkeypatch, 
     assert download_count == 6  # top views each needed one content-based retry
     assert {export.view for export in result.manifest.exports} == set(WordstatView)
     assert all(export.row_count == 1 for export in result.manifest.exports)
+    assert not list(tmp_path.glob("*retry*"))
+    top_export = next(export for export in result.manifest.exports if export.view is WordstatView.TOP_POPULAR)
+    assert top_export.raw_file == "top_popular.csv"
+    assert "январь 2024;100" in (result.run_directory / top_export.raw_file).read_text(encoding="cp1251")
+    assert parquet.read_table(result.run_directory / top_export.file).num_rows == top_export.row_count
 
 
 def test_collect_one_accepts_persistent_empty_top_exports_after_retry(monkeypatch, tmp_path):
@@ -519,6 +529,227 @@ def test_collect_one_accepts_persistent_empty_top_exports_after_retry(monkeypatc
     assert on_disk.empty_views == result.manifest.empty_views
     assert on_disk.status == result.manifest.status
     assert all(export.row_count == 1 for export in result.manifest.exports[2:])
+
+
+def test_collect_one_keeps_empty_top_export_when_retry_times_out(monkeypatch, tmp_path):
+    """A failed top-view retry must fall back to the first empty CSV.
+
+    Chrome can overwrite the first download with the same filename, leaving
+    the snapshot-based downloader with no new path to observe. That timeout
+    must not prevent the other views from being collected.
+    """
+
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    download_count = 0
+
+    async def fake_download(self, page, session, dl_path):
+        nonlocal download_count
+        download_count += 1
+        if download_count == 1:
+            source = dl_path / "export.csv"
+            _write_empty_view_csv(source)
+            return source, None
+        if download_count == 2:
+            raise DownloadNoNewPathError("simulated same-name retry timeout")
+        source = dl_path / f"export-{download_count}.csv"
+        _write_view_csv(source, "тест")
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+    result = asyncio.run(
+        collector._collect_one(
+            _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
+        )
+    )
+
+    assert download_count == 5
+    assert result.view_errors == {}
+    assert [export.row_count for export in result.manifest.exports] == [0, 1, 1, 1]
+    assert result.manifest.empty_views == [WordstatView.TOP_POPULAR]
+
+
+def test_collect_one_preserves_first_csv_when_retry_overwrites_path(monkeypatch, tmp_path):
+    """Fallback parquet and raw CSV must describe the same first export."""
+
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    download_count = 0
+
+    async def fake_download(self, page, session, dl_path):
+        nonlocal download_count
+        download_count += 1
+        source = dl_path / "export.csv"
+        if download_count == 1:
+            _write_empty_view_csv(source)
+            return source, None
+        if download_count == 2:
+            _write_view_csv(source, "тест")
+            raise DownloadNoNewPathError("simulated overwritten-path timeout")
+        source = dl_path / f"export-{download_count}.csv"
+        _write_view_csv(source, "тест")
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector(
+        "cdp", tmp_path, keep_raw=True, settling_seconds=0, empty_export_retry_seconds=0
+    )
+    result = asyncio.run(
+        collector._collect_one(
+            _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
+        )
+    )
+
+    assert result.manifest.exports[0].row_count == 0
+    assert (result.run_directory / "top_popular.csv").read_text(encoding="cp1251") == "Запрос;Показов\n"
+
+
+def test_collect_one_cleans_retry_backup_when_copy_fails(monkeypatch, tmp_path):
+    """A failed backup copy must not leave a temporary file behind."""
+
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    async def fake_download(self, page, session, dl_path):
+        source = dl_path / "export.csv"
+        _write_empty_view_csv(source)
+        return source, None
+
+    def failing_copy(source, destination):
+        raise OSError("simulated backup filesystem failure")
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+    monkeypatch.setattr(collector_module.shutil, "copy2", failing_copy)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+    with pytest.raises(OSError, match="backup filesystem failure"):
+        asyncio.run(
+            collector._collect_one(
+                _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
+            )
+        )
+
+    assert not list(tmp_path.glob("*retry*"))
+
+
+def test_collect_one_does_not_swallow_non_timeout_top_retry_error(monkeypatch, tmp_path):
+    """Only the known same-name timeout is recoverable for a top export."""
+
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    async def fake_download(self, page, session, dl_path):
+        source = dl_path / "export.csv"
+        if source.exists():
+            raise InterfaceChangedError("simulated changed export control")
+        _write_empty_view_csv(source)
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+    with pytest.raises(InterfaceChangedError, match="changed export control"):
+        asyncio.run(
+            collector._collect_one(
+                _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
+            )
+        )
+
+
+def test_collect_one_does_not_swallow_ambiguous_top_retry_timeout(monkeypatch, tmp_path):
+    """A multi-download timeout is not the recoverable no-new-path signal."""
+
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    async def fake_download(self, page, session, dl_path):
+        source = dl_path / "export.csv"
+        if source.exists():
+            raise DownloadTimeoutError("Wordstat produced more than one new CSV for a single export")
+        _write_empty_view_csv(source)
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+    with pytest.raises(DownloadTimeoutError, match="more than one new CSV"):
+        asyncio.run(
+            collector._collect_one(
+                _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
+            )
+        )
+
+
+def test_collect_one_does_not_swallow_dynamics_retry_timeout(monkeypatch, tmp_path):
+    """An empty dynamics retry timeout must preserve fail-closed behavior."""
+
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    download_count = 0
+
+    async def fake_download(self, page, session, dl_path):
+        nonlocal download_count
+        download_count += 1
+        source = dl_path / f"export-{download_count}.csv"
+        if download_count == 3:
+            _write_empty_view_csv(source)
+            return source, None
+        if download_count == 4:
+            raise DownloadNoNewPathError("simulated dynamics retry timeout")
+        _write_view_csv(source, "тест")
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+    result = asyncio.run(
+        collector._collect_one(
+            _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
+        )
+    )
+
+    assert result.manifest.missing_views == [WordstatView.DYNAMICS, WordstatView.REGIONS]
+    assert result.manifest.exports[0].view is WordstatView.TOP_POPULAR
+    assert result.manifest.exports[1].view is WordstatView.TOP_RELATED
+    assert result.view_errors[WordstatView.DYNAMICS] == (
+        "DownloadNoNewPathError: simulated dynamics retry timeout"
+    )
 
 
 def test_collect_one_keeps_dynamics_empty_export_fail_closed(monkeypatch, tmp_path):
