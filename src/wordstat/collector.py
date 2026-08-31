@@ -10,7 +10,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Literal
 
 from browser_use.browser import BrowserSession
 
@@ -175,7 +174,6 @@ class _RetryExportResult:
 
     source: Path
     dataset: CsvDataset
-    kind: Literal["success", "no-new-path"]
 
 
 class WordstatCollector:
@@ -1235,13 +1233,12 @@ class WordstatCollector:
                 if not _should_retry_empty_export(view, dataset):
                     raise
                 shutil.copy2(retry_backup, source)
-                return _RetryExportResult(source=source, dataset=dataset, kind="no-new-path")
+                return _RetryExportResult(source=source, dataset=dataset)
             if retry_escape_warning is not None:
                 escaped_download_warnings.append(f"[{view.value}] {retry_escape_warning}")
             return _RetryExportResult(
                 source=retry_source,
                 dataset=parse_wordstat_csv(retry_source, view),
-                kind="success",
             )
         finally:
             if retry_backup is not None:
