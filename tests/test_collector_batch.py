@@ -1157,6 +1157,86 @@ def test_collect_one_returns_a_partial_result_when_one_view_fails(monkeypatch, t
     assert "simulated" in result.view_errors[WordstatView.REGIONS]
 
 
+@pytest.mark.parametrize(
+    ("dynamics_rows", "date_from", "date_to", "error_match"),
+    [
+        (
+            [("январь 2024", "100"), ("март 2024", "100")],
+            date(2024, 1, 1),
+            date(2024, 3, 31),
+            "gap",
+        ),
+        (
+            [("январь 2024", "100"), ("февраль 2024", "100")],
+            date(2024, 2, 1),
+            date(2024, 3, 31),
+            "requested window",
+        ),
+    ],
+)
+def test_collect_one_rejects_invalid_dynamics_before_writing_parquet(
+    monkeypatch, tmp_path, dynamics_rows, date_from, date_to, error_match
+):
+    """The dynamics period checks must be wired into the real view pipeline.
+
+    The top views succeed first, so _collect_one returns a partial result and
+    leaves a manifest on disk.  The invalid dynamics export must fail before
+    _write_view_export can create dynamics.parquet.
+    """
+
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    async def fake_set_granularity(self, page, granularity):
+        pass
+
+    async def fake_set_period(self, page, granularity, requested_from, requested_to):
+        pass
+
+    download_count = 0
+
+    async def fake_download(self, page, session, dl_path):
+        nonlocal download_count
+        download_count += 1
+        source = dl_path / f"export-{download_count}.csv"
+        if download_count == 3:
+            rows = "".join(f"{period};{count}\n" for period, count in dynamics_rows)
+            source.write_text(f"Период;Показы\n{rows}", encoding="cp1251")
+        else:
+            _write_view_csv(source, "тест")
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_set_granularity", fake_set_granularity)
+    monkeypatch.setattr(WordstatCollector, "_set_period", fake_set_period)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+    result = asyncio.run(
+        collector._collect_one(
+            _FakePage(),
+            _FakeSession(),
+            downloads_path,
+            "тест",
+            "Россия",
+            granularity=Granularity.MONTHLY,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    )
+
+    assert download_count == 3
+    assert result.manifest.missing_views == [WordstatView.DYNAMICS, WordstatView.REGIONS]
+    assert result.manifest.status == "incomplete"
+    assert error_match in result.view_errors[WordstatView.DYNAMICS]
+    assert not (result.run_directory / "dynamics.parquet").exists()
+    assert load_manifest(result.manifest_path).missing_views == [WordstatView.DYNAMICS, WordstatView.REGIONS]
+
+
 def test_collect_one_records_untried_views_after_a_non_final_view_fails(monkeypatch, tmp_path):
     """When the 2nd of 4 views fails (not the last one), the loop breaks
     (see the comment above the view loop) and REGIONS/whichever views come
