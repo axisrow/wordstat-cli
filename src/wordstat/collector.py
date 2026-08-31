@@ -764,6 +764,22 @@ class WordstatCollector:
         date_from: date | None = None,
         date_to: date | None = None,
     ) -> None:
+        """Run both independent dynamics period checks.
+
+        Keep this private entry point as a compatibility shim for callers and
+        tests that predate the split; the checks themselves live in the two
+        methods below and are also invoked independently by new code.
+        """
+        WordstatCollector._assert_dynamics_rows_are_contiguous(dataset, granularity)
+        WordstatCollector._assert_dynamics_rows_within_requested_period(
+            dataset, granularity, date_from=date_from, date_to=date_to
+        )
+
+    @staticmethod
+    def _assert_dynamics_rows_are_contiguous(
+        dataset: CsvDataset,
+        granularity: Granularity,
+    ) -> None:
         # This parses dataset.rows[field] — the exported CSV's period column,
         # not the DOM's displayed cell text. Daily and weekly exports contain
         # DD.MM.YYYY; monthly exports contain a nominative Russian month and
@@ -782,19 +798,9 @@ class WordstatCollector:
         # confirmed-working live path (cycle-review round 1's R2 and round
         # 2's RR1 both raised this same claim from reading the code
         # without this doc open; both were false positives).
-        #
         if not dataset.rows:
             return
-        field = dataset.headers[0]
-        try:
-            if granularity is Granularity.MONTHLY:
-                dates = [_parse_monthly_dynamics_period(row[field]) for row in dataset.rows]
-            else:
-                dates = [datetime.strptime(row[field], "%d.%m.%Y").date() for row in dataset.rows]
-        except ValueError as error:
-            raise InterfaceChangedError(
-                f"Wordstat returned an unexpected {granularity.value} dynamics date format"
-            ) from error
+        dates = WordstatCollector._dynamics_dates(dataset, granularity)
         if len(dates) >= 2:
             for previous, current in zip(dates, dates[1:]):
                 if granularity is Granularity.MONTHLY:
@@ -812,6 +818,18 @@ class WordstatCollector:
                         f"Wordstat returned a gap in the {granularity.value} dynamics series "
                         f"between {previous:%d.%m.%Y} and {current:%d.%m.%Y}"
                     )
+
+    @staticmethod
+    def _assert_dynamics_rows_within_requested_period(
+        dataset: CsvDataset,
+        granularity: Granularity,
+        date_from: date | None = None,
+        date_to: date | None = None,
+    ) -> None:
+        """Reject dynamics rows outside an explicitly requested period."""
+        if not dataset.rows or date_from is None or date_to is None:
+            return
+        dates = WordstatCollector._dynamics_dates(dataset, granularity)
         # Containment, not equality: a shorter export fully inside the
         # requested window is legitimate (the daily series' variable
         # trailing tail, confirmed live — issue #6 phase 1 document), so
@@ -834,32 +852,40 @@ class WordstatCollector:
         # explicit period was requested (date_from/date_to are None for
         # the UI's default window, which this function cannot validate
         # against any specific boundary).
-        if date_from is not None and date_to is not None:
-            # Weekly rows are keyed by the Monday of date_from's week, not
-            # date_from itself (confirmed live — _wait_for_period_applied's
-            # own comment above), so the lower bound must be that aligned
-            # Monday, not the raw requested date, or a legitimate alignment
-            # would be misreported as a stale window.
+        # Weekly rows are keyed by the Monday of date_from's week, not
+        # date_from itself, so the lower bound must be that aligned Monday.
+        if granularity is Granularity.MONTHLY:
+            lower_bound = date(date_from.year, date_from.month, 1)
+            upper_bound = date(date_to.year, date_to.month, 1)
+        else:
+            lower_bound = (
+                date_from - timedelta(days=date_from.weekday())
+                if granularity is Granularity.WEEKLY
+                else date_from
+            )
+            upper_bound = date_to
+        if dates[0] < lower_bound:
+            raise InterfaceChangedError(
+                f"Wordstat {granularity.value} dynamics export is outside the requested window: "
+                f"starts at {dates[0]:%d.%m.%Y}, before {lower_bound:%d.%m.%Y}"
+            )
+        if dates[-1] > upper_bound:
+            raise InterfaceChangedError(
+                f"Wordstat {granularity.value} dynamics export is outside the requested window: "
+                f"ends at {dates[-1]:%d.%m.%Y}, after {upper_bound:%d.%m.%Y}"
+            )
+
+    @staticmethod
+    def _dynamics_dates(dataset: CsvDataset, granularity: Granularity) -> list[date]:
+        field = dataset.headers[0]
+        try:
             if granularity is Granularity.MONTHLY:
-                lower_bound = date(date_from.year, date_from.month, 1)
-                upper_bound = date(date_to.year, date_to.month, 1)
-            else:
-                lower_bound = (
-                    date_from - timedelta(days=date_from.weekday())
-                    if granularity is Granularity.WEEKLY
-                    else date_from
-                )
-                upper_bound = date_to
-            if dates[0] < lower_bound:
-                raise InterfaceChangedError(
-                    f"Wordstat {granularity.value} dynamics export starts at {dates[0]:%d.%m.%Y}, "
-                    f"before the requested window start {lower_bound:%d.%m.%Y}"
-                )
-            if dates[-1] > upper_bound:
-                raise InterfaceChangedError(
-                    f"Wordstat {granularity.value} dynamics export ends at {dates[-1]:%d.%m.%Y}, "
-                    f"after the requested window end {upper_bound:%d.%m.%Y}"
-                )
+                return [_parse_monthly_dynamics_period(row[field]) for row in dataset.rows]
+            return [datetime.strptime(row[field], "%d.%m.%Y").date() for row in dataset.rows]
+        except ValueError as error:
+            raise InterfaceChangedError(
+                f"Wordstat returned an unexpected {granularity.value} dynamics date format"
+            ) from error
 
 
     @staticmethod
