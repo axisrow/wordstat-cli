@@ -1529,6 +1529,53 @@ def test_collect_many_rejects_resume_directory_with_more_than_one_phrase(tmp_pat
 # --- resume updates source_url/updated_at, leaves created_at alone (bugfix #3) ---
 
 
+def test_collect_one_fresh_manifest_uses_url_after_phrase_setup(monkeypatch, tmp_path):
+    """Fresh-run provenance must describe the phrase being collected."""
+
+    _patch_common(monkeypatch)
+
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def set_phrase(self, page, phrase):
+        page.url = f"https://wordstat.yandex.ru/?words={phrase}&region=Россия"
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    call_count = 0
+
+    async def fake_download(self, page, session, dl_path):
+        nonlocal call_count
+        call_count += 1
+        source = dl_path / f"export-{call_count}.csv"
+        _write_view_csv(source, "тест")
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_set_phrase", set_phrase)
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+
+    written_manifests = []
+    real_write_manifest = collector_module.write_manifest
+
+    def recording_write_manifest(path, manifest):
+        written_manifests.append(manifest)
+        real_write_manifest(path, manifest)
+
+    monkeypatch.setattr(collector_module, "write_manifest", recording_write_manifest)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+    page = _FakePage(url="https://wordstat.yandex.ru/?words=предыдущая&region=Россия")
+    result = asyncio.run(collector._collect_one(page, _FakeSession(), downloads_path, "тест", "Россия"))
+
+    expected_url = "https://wordstat.yandex.ru/?words=тест&region=Россия"
+    assert result.manifest.source_url == expected_url
+    assert result.manifest.updated_at > result.manifest.created_at
+    assert written_manifests[0].updated_at > written_manifests[0].created_at
+    assert load_manifest(result.manifest_path).source_url == expected_url
+    assert load_manifest(result.manifest_path).updated_at == result.manifest.updated_at
+
+
 def test_collect_one_resume_updates_source_url_and_updated_at_but_not_created_at(monkeypatch, tmp_path):
     """The bug no reviewer caught: resuming used to leave created_at and
     source_url exactly as they were after the first, interrupted pass, even
@@ -1598,6 +1645,54 @@ def test_collect_one_resume_updates_source_url_and_updated_at_but_not_created_at
     on_disk = load_manifest(result.manifest_path)
     assert on_disk.created_at == original_created_at
     assert on_disk.source_url == resumed_url
+
+
+def test_collect_one_resume_updates_timestamp_before_a_failed_view(monkeypatch, tmp_path):
+    """A resume write must advance updated_at even if its first view fails."""
+
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    first_call = True
+
+    async def first_pass_download(self, page, session, dl_path):
+        nonlocal first_call
+        if not first_call:
+            raise RuntimeError("simulated interruption")
+        first_call = False
+        source = dl_path / "export.csv"
+        _write_view_csv(source, "тест")
+        return source, None
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", first_pass_download)
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+
+    page = _FakePage(url="https://wordstat.yandex.ru/?words=тест&region=Россия")
+    first_result = asyncio.run(collector._collect_one(page, _FakeSession(), downloads_path, "тест", "Россия"))
+    original_updated_at = first_result.manifest.updated_at
+
+    async def failing_resume_download(self, page, session, dl_path):
+        raise RuntimeError("simulated resume failure")
+
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", failing_resume_download)
+    resumed_result = asyncio.run(
+        collector._collect_one(
+            page,
+            _FakeSession(),
+            downloads_path,
+            "тест",
+            "Россия",
+            resume_directory=first_result.run_directory,
+        )
+    )
+
+    assert resumed_result.manifest.updated_at > original_updated_at
+    assert load_manifest(resumed_result.manifest_path).updated_at == resumed_result.manifest.updated_at
 
 
 def test_collect_one_resume_of_an_already_complete_run_does_not_touch_the_manifest(monkeypatch, tmp_path):
