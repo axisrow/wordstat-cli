@@ -210,7 +210,6 @@ class _PreparedRun:
     manifest_path: Path
     manifest: CollectionManifest
     pending_views: list[WordstatView]
-    resumed: bool
 
 
 class WordstatCollector:
@@ -475,7 +474,7 @@ class WordstatCollector:
             # Do not rewrite a complete run: in particular, its source URL
             # and updated_at describe the last actual collection write.
             if not pending_views:
-                return _PreparedRun(run_directory, manifest_path, manifest, pending_views, resumed=True)
+                return _PreparedRun(run_directory, manifest_path, manifest, pending_views)
 
             # Keep the manifest honest while a missing parquet is retried.
             # views_to_collect() considers the file as well as the manifest
@@ -490,7 +489,7 @@ class WordstatCollector:
                     }
                 )
                 write_manifest(manifest_path, manifest)
-            return _PreparedRun(run_directory, manifest_path, manifest, pending_views, resumed=True)
+            return _PreparedRun(run_directory, manifest_path, manifest, pending_views)
 
         run_directory = create_run_directory(self.output_root, phrase)
         manifest_path = run_directory / "manifest.json"
@@ -505,7 +504,7 @@ class WordstatCollector:
             granularity=granularity,
             requested_period=self._requested_period(date_from, date_to),
         )
-        return _PreparedRun(run_directory, manifest_path, manifest, list(WordstatView), resumed=False)
+        return _PreparedRun(run_directory, manifest_path, manifest, list(WordstatView))
 
     async def _collect_one(
         self,
@@ -579,27 +578,18 @@ class WordstatCollector:
                 required=False,
             )
 
-        if prepared.resumed:
-            # Resuming: source_url must not silently keep pointing at
-            # whatever tab/phrase the *previous* session ended on — it is
-            # only accurate as of the last successful write (see
-            # CollectionManifest's docstring), and this write is that.
-            # created_at is deliberately left untouched: it marks when this
-            # run started, not when every view was collected, and a resumed
-            # run's views can legitimately span more than one session.
-            # Doing this after _set_phrase (not before) is required: the
-            # page is still on the previous phrase/tab until _set_phrase
-            # returns.
-            manifest = manifest.model_copy(update={"source_url": await page.get_url(), "updated_at": datetime.now(UTC)})
-            write_manifest(manifest_path, manifest)
-        else:
-            # Capture provenance only after the requested phrase and region
-            # are applied. Before that point the URL still belongs to the
-            # previous phrase in a multi-phrase batch.
-            manifest = manifest.model_copy(
-                update={"source_url": await page.get_url(), "updated_at": datetime.now(UTC)}
-            )
-            write_manifest(manifest_path, manifest)
+        # Capture provenance only after the requested phrase and region are
+        # applied. Before that point the URL still belongs to the previous
+        # phrase in a multi-phrase batch, or to the previous session when
+        # resuming. This is also the first successful write for a fresh run,
+        # so updated_at must advance beyond its creation timestamp. For a
+        # resume, created_at is deliberately left untouched: it marks when
+        # this run started, not when every view was collected, and its views
+        # can legitimately span more than one session.
+        manifest = manifest.model_copy(
+            update={"source_url": await page.get_url(), "updated_at": datetime.now(UTC)}
+        )
+        write_manifest(manifest_path, manifest)
 
         # issue #27: a failure on one view (e.g. the live escaped-download
         # race on regions, or any other InterfaceChangedError/parse failure)
