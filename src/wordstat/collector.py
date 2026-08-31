@@ -1349,26 +1349,11 @@ class WordstatCollector:
     ) -> tuple[Path, str | None]:
         """Download the CSV for the currently selected view.
 
-        Returns ``(path, escape_warning)``. ``escape_warning`` is ``None`` on
-        the common path; it carries a message when a stray escaped download
-        (see ``DownloadEscapedError`` below) was observed in the very same
-        poll tick as the legitimate CSV (issue #27 follow-up). That case
-        must not fail the view — the view's own CSV is fine and already on
-        disk — but the operator still needs to know Chrome dropped a file
-        outside ``downloads_path`` somewhere. Checking ``new_escaped`` only
-        applies when no legitimate CSV was found in this tick would silently
-        lose that signal forever: ``session.downloaded_files`` is
-        session-lifetime and append-only, so the same path is already inside
-        next call's ``before_escaped`` baseline and would never show up in a
-        future ``new_escaped`` diff either — this is not a "check it next
-        time" gap, the escape is gone from view for good once masked by a
-        same-tick success.
+        The baselines are captured before clicking: ``downloaded_files`` is a
+        session-lifetime log, not a per-download collection.
         """
-        # macOS resolves /tmp to /private/tmp; the downloads directory and
-        # session.downloaded_files can report the same physical file under
-        # different unresolved paths, which would otherwise look like two
-        # distinct downloads. Compare resolved paths, keep the original for
-        # return.
+        # Resolve paths while taking the snapshot so /tmp and /private/tmp do
+        # not make one physical file look like two downloads.
         before = self._resolved_file_snapshot(downloads_path, session)
         before_escaped = self._escaped_download_paths(downloads_path, session)
         # "Скачать" now opens a format menu (CSV / XLSX) instead of downloading
@@ -1378,71 +1363,54 @@ class WordstatCollector:
             page, f"() => Boolean(document.querySelector({json.dumps(DOWNLOAD_CSV_MENU_ITEM_SELECTOR)}))"
         )
         await self._click(page, DOWNLOAD_CSV_MENU_ITEM_SELECTOR)
+        return await self._poll_current_view_download(
+            session, downloads_path, before, before_escaped
+        )
+
+    async def _poll_current_view_download(
+        self,
+        session: BrowserSession,
+        downloads_path: Path,
+        before: dict[Path, Path],
+        before_escaped: set[Path],
+    ) -> tuple[Path, str | None]:
+        """Poll for one non-empty CSV, while checking escaped downloads."""
         deadline = time.monotonic() + self.timeout_seconds
         while time.monotonic() < deadline:
             current = self._resolved_file_snapshot(downloads_path, session)
-            new_resolved = set(current) - set(before)
-            csv_files = [current[resolved] for resolved in new_resolved if resolved.suffix.lower() == ".csv"]
-            # Evaluated every tick, including the one that finds the
-            # legitimate CSV: a stray escaped path can land in the exact
-            # same tick as a good download, and (per the docstring above)
-            # that escape would never be detected on any later call either
-            # once masked here — this is the only tick in which it is ever
-            # observable at all.
-            new_escaped = self._escaped_download_paths(downloads_path, session) - before_escaped
-            escape_warning = (
-                "Chrome reported a download outside the run's downloads directory "
-                f"({downloads_path}): {sorted(str(path) for path in new_escaped)}. "
-                "The file was left untouched; it is not safe to move or delete "
-                "automatically. Move it manually if it belongs to this run."
-                if new_escaped
-                else None
+            csv_files = self._new_csv_files(before, current)
+            escape_warning = self._escape_warning(
+                downloads_path,
+                self._escaped_download_paths(downloads_path, session) - before_escaped,
             )
             if len(csv_files) == 1 and csv_files[0].stat().st_size > 0:
-                # The view's own download succeeded — a stray escape seen in
-                # this same tick is reported as a warning, not a failure: the
-                # data this view needed is safely on disk, and raising here
-                # would discard it for no reason (see the docstring above for
-                # why this is the only chance to report the escape at all).
+                # An escape in this same tick must be returned as a warning;
+                # it will be hidden by the next call's session-log baseline.
                 return csv_files[0], escape_warning
             if len(csv_files) > 1:
                 raise DownloadTimeoutError("Wordstat produced more than one new CSV for a single export")
-            # Chrome can report a download at a path outside downloads_path
-            # despite Browser.setDownloadBehavior having been configured for
-            # this session (issue #27 — observed live on the fourth view of a
-            # phrase, landing under the real ~/Downloads). Root-cause
-            # investigated live (CDP :9223, issue #27 fix): every table
-            # view's export link is `a[download]` with an `href="blob:..."`
-            # and `target="_self"` — DYNAMICS and REGIONS are structurally
-            # identical on this point (dumped both live), so a per-target
-            # blob/`_self` explanation was ruled out; browser-use's own
-            # Browser.setDownloadBehavior call (downloads_watchdog.py) is
-            # also browser-level, not per-target, so it should not degrade
-            # between views either. Several live full 4-view runs (single
-            # phrase and a 2-phrase batch, both with --keep-raw, one against
-            # --output-dir inside the repo and one outside it) all completed
-            # cleanly with every file landing inside downloads_path — the
-            # escape did not reproduce on demand, meaning it's an
-            # intermittent Chrome-side race (not deterministically tied to
-            # "the fourth view" or any specific view), not a bug in how this
-            # collector configures downloads_path. So this containment check
-            # can't be "fixed away" upstream; treating the intermittent
-            # escape as an honest, loud failure instead of a silent
-            # mistargeted move/delete is the correct and sufficient fix. This
-            # is never treated as "the" download for this view — that file
-            # is not ours to move or delete (it may not even be from this
-            # run) — but it must fail loudly and specifically instead of a
-            # generic DownloadTimeoutError that leaves the operator guessing
-            # whether Wordstat ever produced anything at all.
-            if new_escaped:
-                raise DownloadEscapedError(
-                    "Chrome reported a download outside the run's downloads directory "
-                    f"({downloads_path}): {sorted(str(path) for path in new_escaped)}. "
-                    "The file was left untouched; it is not safe to move or delete "
-                    "automatically. Move it manually if it belongs to this run."
-                )
+            if escape_warning is not None:
+                raise DownloadEscapedError(escape_warning)
             await asyncio.sleep(0.25)
         raise DownloadNoNewPathError("Wordstat did not produce a new CSV before the download timeout")
+
+    @staticmethod
+    def _new_csv_files(before: dict[Path, Path], current: dict[Path, Path]) -> list[Path]:
+        """Return CSVs newly observed in the downloads directory."""
+        new_resolved = set(current) - set(before)
+        return [current[path] for path in new_resolved if path.suffix.lower() == ".csv"]
+
+    @staticmethod
+    def _escape_warning(directory: Path, escaped: set[Path]) -> str | None:
+        """Format an escaped-download warning, or return ``None``."""
+        if not escaped:
+            return None
+        return (
+            "Chrome reported a download outside the run's downloads directory "
+            f"({directory}): {sorted(str(path) for path in escaped)}. "
+            "The file was left untouched; it is not safe to move or delete "
+            "automatically. Move it manually if it belongs to this run."
+        )
 
     async def _click(self, page, selector: str) -> None:
         result = await page.evaluate(
