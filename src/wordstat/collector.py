@@ -596,35 +596,38 @@ class WordstatCollector:
                         # first file. Keep the original beside the temporary
                         # downloads directory so a no-new-path fallback cannot
                         # pair the old parsed dataset with new raw contents.
-                        with tempfile.NamedTemporaryFile(
-                            prefix=f".{view.value}-retry-",
-                            suffix=".csv",
-                            dir=self.output_root,
-                            delete=False,
-                        ) as backup_file:
-                            retry_backup = Path(backup_file.name)
-                        shutil.copy2(source, retry_backup)
+                        retry_backup: Path | None = None
                         try:
-                            retry_source, retry_escape_warning = await self._download_current_view(
-                                page, session, downloads_path
-                            )
-                        except DownloadNoNewPathError:
-                            # A repeated export can overwrite the original CSV
-                            # instead of creating a new path. In that case the
-                            # snapshot-based download wait times out even
-                            # though the first, legitimate empty export is
-                            # already available. Top exports are allowed to be
-                            # empty, so keep that result and continue with the
-                            # remaining views rather than failing the phrase.
-                            if not _should_retry_empty_export(view, dataset):
-                                raise
-                            source = retry_backup
-                            retry_backup = None
-                        else:
-                            source = retry_source
-                            if retry_escape_warning is not None:
-                                escaped_download_warnings.append(f"[{view.value}] {retry_escape_warning}")
-                            dataset = parse_wordstat_csv(source, view)
+                            with tempfile.NamedTemporaryFile(
+                                prefix=f".{view.value}-retry-",
+                                suffix=".csv",
+                                dir=self.output_root,
+                                delete=False,
+                            ) as backup_file:
+                                retry_backup = Path(backup_file.name)
+                            shutil.copy2(source, retry_backup)
+                            try:
+                                retry_source, retry_escape_warning = await self._download_current_view(
+                                    page, session, downloads_path
+                                )
+                            except DownloadNoNewPathError:
+                                # A repeated export can overwrite the original
+                                # CSV instead of creating a new path. In that
+                                # case the snapshot-based download wait times
+                                # out even though the first, legitimate empty
+                                # export is already available. Top exports are
+                                # allowed to be empty, so keep that result and
+                                # continue with the remaining views rather
+                                # than failing the phrase.
+                                if not _should_retry_empty_export(view, dataset):
+                                    raise
+                                source = retry_backup
+                                retry_backup = None
+                            else:
+                                source = retry_source
+                                if retry_escape_warning is not None:
+                                    escaped_download_warnings.append(f"[{view.value}] {retry_escape_warning}")
+                                dataset = parse_wordstat_csv(source, view)
                         finally:
                             if retry_backup is not None:
                                 retry_backup.unlink(missing_ok=True)

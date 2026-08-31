@@ -612,6 +612,39 @@ def test_collect_one_preserves_first_csv_when_retry_overwrites_path(monkeypatch,
     assert (result.run_directory / "top_popular.csv").read_text(encoding="cp1251") == "Запрос;Показов\n"
 
 
+def test_collect_one_cleans_retry_backup_when_copy_fails(monkeypatch, tmp_path):
+    """A failed backup copy must not leave a temporary file behind."""
+
+    _patch_common(monkeypatch)
+    downloads_path = tmp_path / "downloads"
+    downloads_path.mkdir()
+
+    async def fake_select_view(self, page, selector, view):
+        pass
+
+    async def fake_download(self, page, session, dl_path):
+        source = dl_path / "export.csv"
+        _write_empty_view_csv(source)
+        return source, None
+
+    def failing_copy(source, destination):
+        raise OSError("simulated backup filesystem failure")
+
+    monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
+    monkeypatch.setattr(WordstatCollector, "_download_current_view", fake_download)
+    monkeypatch.setattr(collector_module.shutil, "copy2", failing_copy)
+
+    collector = WordstatCollector("cdp", tmp_path, settling_seconds=0, empty_export_retry_seconds=0)
+    with pytest.raises(OSError, match="backup filesystem failure"):
+        asyncio.run(
+            collector._collect_one(
+                _FakePage(), _FakeSession(), downloads_path, "тест", "Россия", set_region=False
+            )
+        )
+
+    assert not list(tmp_path.glob("*retry*"))
+
+
 def test_collect_one_does_not_swallow_non_timeout_top_retry_error(monkeypatch, tmp_path):
     """Only the known same-name timeout is recoverable for a top export."""
 
