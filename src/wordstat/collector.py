@@ -591,10 +591,25 @@ class WordstatCollector:
                     if _should_retry_empty_export(view, dataset) or _is_untrustworthy_empty_export(view, dataset):
                         if self.empty_export_retry_seconds > 0:
                             await asyncio.sleep(self.empty_export_retry_seconds)
-                        source, escape_warning = await self._download_current_view(page, session, downloads_path)
-                        if escape_warning is not None:
-                            escaped_download_warnings.append(f"[{view.value}] {escape_warning}")
-                        dataset = parse_wordstat_csv(source, view)
+                        try:
+                            retry_source, retry_escape_warning = await self._download_current_view(
+                                page, session, downloads_path
+                            )
+                        except DownloadTimeoutError:
+                            # A repeated export can overwrite the original CSV
+                            # instead of creating a new path. In that case the
+                            # snapshot-based download wait times out even
+                            # though the first, legitimate empty export is
+                            # already available. Top exports are allowed to be
+                            # empty, so keep that result and continue with the
+                            # remaining views rather than failing the phrase.
+                            if not _should_retry_empty_export(view, dataset):
+                                raise
+                        else:
+                            source = retry_source
+                            if retry_escape_warning is not None:
+                                escaped_download_warnings.append(f"[{view.value}] {retry_escape_warning}")
+                            dataset = parse_wordstat_csv(source, view)
                     if _is_untrustworthy_empty_export(view, dataset):
                         raise InterfaceChangedError(
                             f"Wordstat returned an empty {view.value} CSV after a retry, but the page had "
