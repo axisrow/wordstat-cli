@@ -94,7 +94,12 @@ def _read_phrases_file(path: Path) -> str:
     default=None,
     help="Dynamics window start (YYYY-MM-DD); ignored by Wordstat for weekly granularity.",
 )
-@click.option("--date-to", type=str, default=None, help="Dynamics window end (YYYY-MM-DD).")
+@click.option(
+    "--date-to",
+    type=str,
+    default=None,
+    help="Dynamics window end (YYYY-MM-DD); ignored by Wordstat for weekly granularity.",
+)
 @click.option(
     "--keep-raw",
     is_flag=True,
