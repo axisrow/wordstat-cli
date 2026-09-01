@@ -285,6 +285,207 @@ def test_batch_reports_escaped_download_warnings(monkeypatch, tmp_path: Path):
     assert "чай: [regions] Chrome reported a download outside the run's downloads directory" in result.output
 
 
+def _fake_manifest_all_views_present(phrase: str) -> CollectionManifest:
+    """All four views in exports (nothing missing, nothing failed), with
+    top_popular/top_related at row_count 0 — the shape of an ordinary live
+    Wordstat run (issue #22/#25: those two reports export zero rows every
+    time). Before the wordstat-35 fix this read as fully collected."""
+    return CollectionManifest(
+        phrase=phrase,
+        region="Россия",
+        created_at=datetime(2026, 8, 20, 12, 0, tzinfo=UTC),
+        source_url="https://wordstat.yandex.ru/?words=" + phrase,
+        exports=[
+            ExportSummary(
+                view=WordstatView.TOP_POPULAR,
+                file="top_popular.parquet",
+                raw_file=None,
+                row_count=0,
+                dtypes={"Запрос": "string"},
+            ),
+            ExportSummary(
+                view=WordstatView.TOP_RELATED,
+                file="top_related.parquet",
+                raw_file=None,
+                row_count=0,
+                dtypes={"Запрос": "string"},
+            ),
+            ExportSummary(
+                view=WordstatView.DYNAMICS,
+                file="dynamics.parquet",
+                raw_file=None,
+                row_count=24,
+                dtypes={"Дата": "string"},
+            ),
+            ExportSummary(
+                view=WordstatView.REGIONS,
+                file="regions.parquet",
+                raw_file=None,
+                row_count=934,
+                dtypes={"Регион": "string"},
+            ),
+        ],
+    )
+
+
+def _fake_manifest_fully_collected(phrase: str) -> CollectionManifest:
+    """Every view present with non-zero rows — the only shape --strict-exit
+    accepts as complete."""
+    base = _fake_manifest_all_views_present(phrase)
+    return base.model_copy(
+        update={
+            "exports": [
+                export.model_copy(update={"row_count": max(export.row_count, 1)})
+                for export in base.exports
+            ]
+        }
+    )
+
+
+def test_empty_views_mark_result_partial_in_the_summary(monkeypatch, tmp_path: Path):
+    """wordstat-35: a result whose only defect is a zero-row export (all four
+    views present, none failed) must not print a plain "Собрано 1 из 1" —
+    manifest.status is "incomplete" for exactly this shape, and the summary
+    ignoring it is how CI swallowed an incomplete dataset. The per-view line
+    must say the export is empty, not "не собран": the parquet exists with its
+    header schema, the data is empty."""
+
+    async def fake_collect_many(self, phrases, region="Россия", resume_directory=None):
+        run_directory = tmp_path / "чай"
+        manifest_path = run_directory / "manifest.json"
+        return BatchCollectionResult(
+            total=1,
+            results=[
+                CollectionResult(
+                    run_directory=run_directory,
+                    manifest_path=manifest_path,
+                    manifest=_fake_manifest_all_views_present("чай"),
+                )
+            ],
+            failures=[],
+        )
+
+    monkeypatch.setattr(cli.WordstatCollector, "collect_many", fake_collect_many)
+
+    result = CliRunner().invoke(main, ["collect", "чай"])
+
+    assert result.exit_code == 0
+    assert "Собрано 1 из 1, из них частично 1" in result.output
+    assert "чай [top_popular]: пустой экспорт (0 строк)" in result.output
+
+
+def test_strict_exit_on_a_fully_collected_run_exits_zero(monkeypatch, tmp_path: Path):
+    async def fake_collect_many(self, phrases, region="Россия", resume_directory=None):
+        run_directory = tmp_path / "чай"
+        manifest_path = run_directory / "manifest.json"
+        return BatchCollectionResult(
+            total=1,
+            results=[
+                CollectionResult(
+                    run_directory=run_directory,
+                    manifest_path=manifest_path,
+                    manifest=_fake_manifest_fully_collected("чай"),
+                )
+            ],
+            failures=[],
+        )
+
+    monkeypatch.setattr(cli.WordstatCollector, "collect_many", fake_collect_many)
+
+    result = CliRunner().invoke(main, ["collect", "чай", "--strict-exit"])
+
+    assert result.exit_code == 0
+
+
+def test_strict_exit_on_a_partial_run_exits_two(monkeypatch, tmp_path: Path):
+    """wordstat-35 (production incident, 2026-09-01): a partial run exits 0 by
+    default (issue #27 contract, unchanged) — but with --strict-exit it must
+    exit 2, so CI keyed on exit codes alone cannot silently accept an
+    incomplete dataset."""
+
+    async def fake_collect_many(self, phrases, region="Россия", resume_directory=None):
+        run_directory = tmp_path / "чай"
+        manifest_path = run_directory / "manifest.json"
+        return BatchCollectionResult(
+            total=1,
+            results=[
+                CollectionResult(
+                    run_directory=run_directory,
+                    manifest_path=manifest_path,
+                    manifest=_fake_manifest_with_missing_view("чай"),
+                    view_errors={WordstatView.REGIONS: "DownloadTimeoutError: simulated"},
+                )
+            ],
+            failures=[],
+        )
+
+    monkeypatch.setattr(cli.WordstatCollector, "collect_many", fake_collect_many)
+
+    result = CliRunner().invoke(main, ["collect", "чай", "--strict-exit"])
+
+    assert result.exit_code == 2
+
+
+def test_strict_exit_on_a_zero_row_export_run_exits_two(monkeypatch, tmp_path: Path):
+    """Zero-row exports count as "not fully collected" under --strict-exit
+    too, not only missing/failed views. Consequence, deliberate: on live
+    Wordstat the top views export zero rows on every run (issue #22/#25), so
+    an otherwise complete live run exits 2 under this flag — "strict" means
+    "every requested view produced rows", not "the collector did everything
+    it could" (see the comment at the partial_count loop in cli.py)."""
+
+    async def fake_collect_many(self, phrases, region="Россия", resume_directory=None):
+        run_directory = tmp_path / "чай"
+        manifest_path = run_directory / "manifest.json"
+        return BatchCollectionResult(
+            total=1,
+            results=[
+                CollectionResult(
+                    run_directory=run_directory,
+                    manifest_path=manifest_path,
+                    manifest=_fake_manifest_all_views_present("чай"),
+                )
+            ],
+            failures=[],
+        )
+
+    monkeypatch.setattr(cli.WordstatCollector, "collect_many", fake_collect_many)
+
+    result = CliRunner().invoke(main, ["collect", "чай", "--strict-exit"])
+
+    assert result.exit_code == 2
+
+
+def test_strict_exit_on_phrase_failures_still_exits_one(monkeypatch, tmp_path: Path):
+    """Failures keep exit code 1 even under --strict-exit: the non-zero codes
+    rank severity, and a phrase that collected nothing at all is strictly
+    worse than a phrase that collected some views. Collapsing both into 2
+    would let a caller keyed to "1 means a phrase needs a full re-run" miss
+    that signal in a mixed batch (one dead phrase + one partial), so when
+    both conditions hold the heavier code wins."""
+
+    async def fake_collect_many(self, phrases, region="Россия", resume_directory=None):
+        run_directory = tmp_path / "чай"
+        manifest_path = run_directory / "manifest.json"
+        return BatchCollectionResult(
+            total=2,
+            results=[
+                CollectionResult(
+                    run_directory=run_directory,
+                    manifest_path=manifest_path,
+                    manifest=_fake_manifest_all_views_present("чай"),
+                )
+            ],
+            failures=[PhraseFailure(phrase="кофе", error=PhraseEntryError("boom"))],
+        )
+
+    monkeypatch.setattr(cli.WordstatCollector, "collect_many", fake_collect_many)
+
+    result = CliRunner().invoke(main, ["collect", "чай", "кофе", "--strict-exit"])
+
+    assert result.exit_code == 1
+
+
 def test_batch_aborted_early_reports_untried_phrases_distinctly(monkeypatch):
     async def fake_collect_many(self, phrases, region="Россия", resume_directory=None):
         # Only the first of 3 phrases was attempted (and failed) before the
@@ -379,3 +580,36 @@ def test_resume_dir_mismatched_phrase_is_rejected_before_the_browser_starts(tmp_
     assert result.exit_code != 0
     assert "does not match" in result.output
     assert "Traceback" not in result.output
+
+
+def _readme_text() -> str:
+    return (Path(__file__).resolve().parents[1] / "README.md").read_text(encoding="utf-8")
+
+
+def test_readme_documents_that_weekly_ignores_an_explicit_period():
+    """Wordstat silently ignores --date-from/--date-to for --granularity
+    weekly and returns its default ~2-year window (confirmed by a live run on
+    2026-08-31). An undocumented limitation here is worse than most: the
+    request is *accepted* (validate_period passes, the picker clicks through),
+    so the only honest place to warn the operator is the docs. The wording is
+    free to change; these anchors must keep naming weekly, the ignoring, and
+    the default window."""
+    text = _readme_text()
+
+    assert "weekly" in text
+    assert "игнориру" in text
+    assert "дефолтное окно" in text
+
+
+def test_collect_help_documents_the_weekly_default_window():
+    """The same weekly limitation must also surface where a user actually
+    looks before typing a command: `wordstat collect --help`. Whitespace is
+    flattened first: click wraps help text at the terminal width, so the
+    anchors must not depend on where a line break happens to fall."""
+    result = CliRunner().invoke(main, ["collect", "--help"])
+
+    flattened = " ".join(result.output.split())
+
+    assert result.exit_code == 0
+    assert "weekly" in flattened
+    assert "default window" in flattened
