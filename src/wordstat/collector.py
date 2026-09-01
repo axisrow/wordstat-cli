@@ -53,6 +53,14 @@ GRANULARITY_SELECTOR = ".wordstat__content-type_select > button"
 DATE_RANGE_SELECTOR = ".range-datepicker__selected-dates > button"
 REGION_BUTTON_SELECTOR = ".settings__selected button"
 TABLE_ROW_SELECTOR = ".table__wrapper tbody tr"
+# Wordstat renders this banner when its backend returns no data for the
+# current phrase/view while the page itself stays fully interactive (observed
+# live on 2026-08-31: the "Динамика" tab showed it for every phrase, and every
+# dynamics export died with a bare predicate-timeout InterfaceChangedError
+# that read like a markup change). `_page_state_snapshot` looks for it so a
+# Yandex-side data outage is distinguishable from a broken selector in the
+# error message alone.
+EMPTY_RESULT_BANNER_TEXT = "Нет подходящих запросов"
 # Tab selectors live here with the rest of the DOM knowledge; the markup is
 # inconsistent enough (id- vs for-based) that it is worth having in one place.
 VIEW_SELECTORS = {
@@ -1199,7 +1207,8 @@ class WordstatCollector:
         if not matched:
             raise PhraseEntryError(
                 f"Wordstat search field state {state!r} after {max_attempts} attempts, "
-                f"attempt states: {attempt_states!r}, expected {phrase!r}"
+                f"attempt states: {attempt_states!r}, expected {phrase!r}, "
+                f"page state: {await self._page_state_snapshot(page)}"
             )
 
         await self._click(page, SEARCH_SELECTOR)
@@ -1465,6 +1474,31 @@ class WordstatCollector:
         if json.loads(result) != {"count": 1}:
             raise InterfaceChangedError(f"Wordstat control {text!r} was not uniquely found")
 
+    async def _page_state_snapshot(self, page) -> str:
+        """One best-effort DOM read attached to failure messages.
+
+        Called only on error paths, so an evaluation failure of its own (the
+        CDP connection may already be gone) must degrade to a short note
+        instead of replacing the caller's original error.
+        """
+        banner_text = json.dumps(EMPTY_RESULT_BANNER_TEXT)
+        try:
+            snapshot = json.loads(
+                await page.evaluate(
+                    f"""() => JSON.stringify({{
+                        url: location.href,
+                        readyState: document.readyState,
+                        emptyResultBanner: (document.body?.innerText ?? '')
+                            .includes({banner_text}) ? {banner_text} : null,
+                        tableRows: document.querySelectorAll({json.dumps(TABLE_ROW_SELECTOR)}).length,
+                        saveButton: Boolean(document.querySelector({json.dumps(DOWNLOAD_SELECTOR)})),
+                    }})"""
+                )
+            )
+            return json.dumps(snapshot, ensure_ascii=False)
+        except Exception as error:  # noqa: BLE001 - diagnostics must never mask the real error
+            return f"unavailable ({type(error).__name__}: {error})"
+
     async def _wait_for(self, page, expression: str, seconds: float | None = None, required: bool = True) -> None:
         """Poll `expression` until it's true, or give up after the deadline.
 
@@ -1482,6 +1516,7 @@ class WordstatCollector:
         if required:
             raise InterfaceChangedError(
                 f"Wordstat did not reach the expected page state before the timeout: {expression}"
+                f"; page state: {await self._page_state_snapshot(page)}"
             )
 
     @staticmethod
