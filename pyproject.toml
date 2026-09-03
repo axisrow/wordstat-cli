@@ -7,6 +7,10 @@ requires-python = ">=3.12,<3.13"
 dependencies = [
     "browser-use",
     "click>=8.1",
+    # auth.py decrypts Chrome cookie values (wordstat login); it already sits
+    # in the venv transitively, but an undeclared import would break a clean
+    # `uv sync` in CI.
+    "cryptography>=50",
     "pyarrow>=17",
     "pydantic>=2.12",
 ]
