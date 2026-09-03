@@ -1,1 +1,5 @@
-cdp_url = "http://127.0.0.1:9222"
+# 9223, not the conventional 9222: the everyday Chrome occupies 9222 without
+# exposing CDP there, so the dedicated wordstat Chrome profile runs on 9223.
+cdp_url = "http://127.0.0.1:9223"
+# Source of Yandex cookies for `wordstat login` (the everyday browser profile).
+chrome_profile = "~/Library/Application Support/Google/Chrome/Default"

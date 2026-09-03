@@ -13,6 +13,7 @@ from pathlib import Path
 
 from browser_use.browser import BrowserSession
 
+from wordstat import dom
 from wordstat.csv_io import parse_wordstat_csv
 from wordstat.dataset_io import write_dataset
 from wordstat.errors import (
@@ -43,8 +44,8 @@ from wordstat.storage import (
     write_manifest,
 )
 
-WORDSTAT_URL = "https://wordstat.yandex.ru/"
-QUERY_SELECTOR = 'input[placeholder="Введите слово или словосочетание"]'
+WORDSTAT_URL = dom.WORDSTAT_URL
+QUERY_SELECTOR = dom.QUERY_SELECTOR
 SEARCH_SELECTOR = ".wordstat__search-button"
 DOWNLOAD_SELECTOR = "button.save-button"
 DOWNLOAD_CSV_MENU_ITEM_SELECTOR = "a[download]:has(button.save-csv-button)"
@@ -1126,12 +1127,7 @@ class WordstatCollector:
             raise InterfaceChangedError(f"Wordstat option {text!r} was not uniquely found")
 
     async def _assert_authenticated(self, page) -> None:
-        state = await page.evaluate(
-            """() => JSON.stringify({
-                url: location.href,
-                hasLogout: [...document.querySelectorAll('a')].some((link) => link.textContent?.trim() === 'Выйти'),
-            })"""
-        )
+        state = await page.evaluate(dom.AUTH_PROBE)
         parsed = json.loads(state)
         if "passport.yandex.ru" in parsed["url"] or not parsed["hasLogout"]:
             raise AuthenticationRequiredError(

@@ -3949,6 +3949,7 @@ source = { editable = "." }
 dependencies = [
     { name = "browser-use" },
     { name = "click" },
+    { name = "cryptography" },
     { name = "pyarrow" },
     { name = "pydantic" },
 ]
@@ -3963,6 +3964,7 @@ dev = [
 requires-dist = [
     { name = "browser-use", editable = "../browser-use" },
     { name = "click", specifier = ">=8.1" },
+    { name = "cryptography", specifier = ">=50" },
     { name = "pyarrow", specifier = ">=17" },
     { name = "pydantic", specifier = ">=2.12" },
 ]

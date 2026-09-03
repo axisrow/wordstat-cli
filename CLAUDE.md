@@ -6,8 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `wordstat` — CLI, экспортирующий отчёты из веб-интерфейса Яндекс Вордстат
 через уже открытый и авторизованный Chrome (подключение по CDP) и сохраняющий
-их как типизированные Parquet-датасеты. Инструмент не логинится сам и не
+их как типизированные Parquet-датасеты. Сбор (`collect`) не логинится сам и не
 хранит учётные данные — он падает, если Wordstat показывает страницу входа.
+Занести сессию в подключённый Chrome можно отдельной явной командой
+`wordstat login` (перенос уже существующей сессии куками из повседневного
+профиля Chrome, без ввода пароля и без хранения креденшелов; см. `auth.py`).
 
 Скачанный CSV — промежуточный артефакт: он парсится, конвертируется и
 удаляется, если не передан `--keep-raw`. XLSX не скачивается вообще (кликается
@@ -27,7 +30,7 @@ uv sync --all-groups
 существовать рядом с этим репозиторием, иначе `uv sync` упадёт.
 
 Chrome должен быть запущен с доступным CDP endpoint (по умолчанию
-`http://127.0.0.1:9222`), заранее авторизован в Яндексе.
+`http://127.0.0.1:9223`, см. `wordstat.toml`), заранее авторизован в Яндексе.
 
 ## Commands
 
@@ -44,6 +47,12 @@ wordstat collect "ремонт квартир" "натяжные потолки"
 wordstat collect "ремонт квартир" --region "Москва" \
   --resume-dir ./wordstat-output/runs/20260821T090000Z-ремонт-квартир
 
+# перенести Yandex-сессию из повседневного профиля Chrome в подключённый Chrome
+# (при первом запуске macOS покажет диалог Keychain — «Always Allow»)
+wordstat login
+wordstat login --check   # только проверить авторизацию (exit 0/1)
+wordstat logout          # убрать Yandex-сессию из подключённого Chrome (зеркало login)
+
 # тесты
 pytest
 pytest tests/test_csv_io.py::test_parse_wordstat_csv_rejects_duplicate_headers  # один тест
@@ -59,12 +68,15 @@ ruff check .
 Пайплайн `cli.py` → `collector.py` → (`csv_io.py` → `dtypes.py` →
 `dataset_io.py` + `storage.py`), с Pydantic-моделями (`models.py`) как
 контрактом между слоями и доменными исключениями (`errors.py`), которые CLI
-превращает в `click.ClickException`.
+превращает в `click.ClickException`. `dom.py` — единственный источник
+DOM-знаний о Вордстате (URL, селекторы, JS-пробы), общий для `collector.py`
+и `auth.py`.
 
-- **`collector.py` (`WordstatCollector.collect_many`)** — единственное место,
+- **`collector.py` (`WordstatCollector.collect_many`)** — основное место,
   где происходит взаимодействие с браузером через `browser_use.BrowserSession`
   (CDP-подключение к уже запущенному Chrome, `keep_alive=True`,
-  `allowed_domains` ограничены доменами Wordstat/Passport). Одна сессия и одна
+  `allowed_domains` ограничены доменами Wordstat/Passport; второе и последнее
+  место — `auth.py`, см. ниже). Одна сессия и одна
   страница обслуживают весь батч фраз; `collect` — тонкая обёртка над
   `collect_many([phrase])` для одной фразы, пробрасывающая исходный тип
   исключения (не оборачивает его). Последовательность жёстко детерминирована:
@@ -299,6 +311,30 @@ ruff check .
   и словарь dtypes, который уходит в `manifest.json` — если колонка показов
   вдруг оказалась `string`, эвристика встретила неучтённый формат, и это видно
   в манифесте, а не проваливается тихо.
+
+- **`auth.py` (`wordstat login`)** — перенос уже существующей Yandex-сессии в
+  подключённый Chrome: читает куки доменов Яндекса (суффиксный allowlist
+  `yandex.ru`/`ya.ru`/`yandex.com`/`yandex.net` — не `LIKE '%yandex%'`,
+  который зацепил бы `yandex.zoom.us`) из SQLite-базы локального профиля
+  Chrome через `?mode=ro&immutable=1` (без лока живого браузера), расшифровывает
+  v10-BLOB'ы (AES-128-CBC, ключ = PBKDF2 от «Chrome Safe Storage» из Keychain,
+  IV — 16 пробелов; с Chrome ~104 plaintext начинается с 32-байтного
+  SHA256(host) — префикс отрезается по совпадению, оба варианта написания
+  host, иначе старый формат) и ставит их через `Storage.setCookies` на
+  корневом `session.cdp_client` (приватный `_cdp_set_cookies` browser-use —
+  мина: молчаливый no-op без agent-focus-target). Инварианты: значения кук
+  никогда не печатаются/не логируются/не пишутся на диск (отчёт — только
+  счётчики `ImportReport`); `clearCookies` не вызывается никогда — операция
+  идемпотентна и не трогает чужие куки; после установки обязательна сверка
+  `session.cookies()` и проверка «Выйти»; не-v10 префикс — fail-loud
+  `SessionImportError`. Единственная darwin-точка —
+  `fetch_keychain_password()`; остальное тестируется с инжектированным ключом.
+  Решение владельца 01.09.2026; 20.08 откладывали другой механизм — копирование
+  файла `Cookies` целиком. Зеркальная `logout_session` (`wordstat logout`)
+  удаляет только Yandex-куки: `Storage.deleteCookies` в Chrome browser-endpoint
+  отсутствует, поэтому удаление — перезапись каждой куки истёкшим `expires`
+  через тот же корневой `Storage.setCookies`, с верификацией через
+  `session.cookies()` и проверкой отсутствия «Выйти».
 
 - **`models.py`** — Pydantic-модели как единственный контракт форматов
   данных между слоями: `WordstatView` (enum четырёх отчётов), `CsvDataset`

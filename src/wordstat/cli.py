@@ -1,6 +1,7 @@
 """Command-line entry point."""
 
 import asyncio
+from collections.abc import Awaitable
 from pathlib import Path
 
 import click
@@ -13,7 +14,10 @@ from wordstat.periods import Granularity, parse_date, validate_period
 from wordstat.storage import prepare_resume_directory
 
 _CONFIG = load_config()
-_DEFAULT_CDP_URL = _CONFIG.get("cdp_url", "http://127.0.0.1:9222")
+_DEFAULT_CDP_URL = _CONFIG.get("cdp_url", "http://127.0.0.1:9223")
+_DEFAULT_CHROME_PROFILE = Path(
+    _CONFIG.get("chrome_profile", "~/Library/Application Support/Google/Chrome/Default")
+).expanduser()
 # Wordstat exports CSV as UTF-8 with BOM; a phrases file typed or saved
 # on the same machine can plausibly be in either, and utf-8-sig must come
 # before plain utf-8: a BOM'd file decodes successfully under plain
@@ -283,3 +287,82 @@ def collect(
         # from "a phrase failed outright"; without the flag the issue #27
         # contract is unchanged and a partial run still exits 0.
         ctx.exit(2)
+
+
+def _invoke[T](coro: Awaitable[T]) -> T:
+    """Run one auth coroutine, surfacing WordstatError as a CLI error."""
+
+    try:
+        return asyncio.run(coro)
+    except WordstatError as error:
+        raise click.ClickException(str(error)) from error
+
+
+@main.command()
+@click.option(
+    "--from-chrome-profile",
+    "from_chrome_profile",
+    type=click.Path(path_type=Path, exists=True, file_okay=False),
+    default=_DEFAULT_CHROME_PROFILE,
+    show_default=True,
+    help="Local Chrome profile whose Yandex cookies (an already logged-in session) to transfer.",
+)
+@click.option("--cdp-url", envvar="WORDSTAT_CDP_URL", default=_DEFAULT_CDP_URL, show_default=True)
+@click.option(
+    "--check",
+    "check_only",
+    is_flag=True,
+    default=False,
+    help="Only verify whether the attached Chrome is authorized in Wordstat; no cookies are read or set.",
+)
+@click.pass_context
+def login(
+    ctx: click.Context,
+    from_chrome_profile: Path,
+    cdp_url: str,
+    check_only: bool,
+) -> None:
+    """Transfer an existing Yandex session into the attached Chrome.
+
+    Reads Yandex cookies from a local Chrome profile (the everyday browser,
+    decrypted via the macOS Keychain — expect one access prompt) and installs
+    them into the Chrome attached over CDP. `wordstat collect` never logs in by
+    itself; this command is the explicit, separate way to provision its
+    session. Cookie values are never printed, logged, or written to disk.
+    """
+    # Imported here (not at module top) so `wordstat collect` never pays the
+    # cryptography import that only the session commands need.
+    from wordstat import auth
+
+    if check_only:
+        if _invoke(auth.check_auth(cdp_url)):
+            click.echo("Авторизация в Wordstat подтверждена")
+        else:
+            click.echo("Attached Chrome is not authorized in Wordstat", err=True)
+            ctx.exit(1)
+        return
+    report = _invoke(auth.import_session(cdp_url, from_chrome_profile))
+    skipped = report.skipped_expired + report.skipped_empty + report.skipped_domains
+    click.echo(
+        f"Перенесено кук: {report.imported} (сессионных, не переживут перезапуск Chrome: "
+        f"{report.session_count}; пропущено истёкших/пустых/посторонних: {skipped}; "
+        f"не применилось: {report.mismatched_after_set})"
+    )
+    click.echo(f"Домены: {', '.join(report.domains)}")
+    click.echo("Авторизация в Wordstat подтверждена")
+
+
+@main.command()
+@click.option("--cdp-url", envvar="WORDSTAT_CDP_URL", default=_DEFAULT_CDP_URL, show_default=True)
+def logout(cdp_url: str) -> None:
+    """Remove the Yandex session from the attached Chrome (mirror of login).
+
+    Deletes only cookies on Yandex domains; everything else in the profile
+    stays untouched. Afterwards Wordstat shows its login page again — restore
+    the session with `wordstat login`.
+    """
+    from wordstat import auth
+
+    report = _invoke(auth.logout_session(cdp_url))
+    click.echo(f"Удалено Yandex-кук: {report.deleted} (осталось: {report.remaining})")
+    click.echo("Авторизация в Wordstat отсутствует")
