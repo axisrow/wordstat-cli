@@ -54,7 +54,7 @@ def cookies_db(tmp_path: Path) -> Path:
         """CREATE TABLE cookies (
             host_key TEXT, name TEXT, value TEXT, encrypted_value BLOB, path TEXT,
             expires_utc INTEGER, has_expires INTEGER, is_secure INTEGER,
-            is_httponly INTEGER, samesite INTEGER
+            is_httponly INTEGER, samesite INTEGER, top_frame_site_key TEXT
         )"""
     )
     connection.commit()
@@ -65,12 +65,15 @@ def cookies_db(tmp_path: Path) -> Path:
 def insert_cookie(
     db: Path, host: str, name: str = "cookie", encrypted: bytes = b"", value: str = "",
     expires_utc: int = 0, has_expires: int = 0, is_secure: int = 1, samesite: int = -1,
+    top_frame_site_key: str = "",
 ) -> None:
     connection = sqlite3.connect(db)
     connection.execute(
         "INSERT INTO cookies (host_key, name, value, encrypted_value, path, expires_utc,"
-        " has_expires, is_secure, is_httponly, samesite) VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (host, name, value, encrypted, "/", expires_utc, has_expires, is_secure, 0, samesite),
+        " has_expires, is_secure, is_httponly, samesite, top_frame_site_key)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (host, name, value, encrypted, "/", expires_utc, has_expires, is_secure, 0, samesite,
+         top_frame_site_key),
     )
     connection.commit()
     connection.close()
@@ -192,6 +195,85 @@ def test_read_profile_cookies_filters_and_counts(cookies_db: Path) -> None:
     assert set(report.__dataclass_fields__) >= {"imported", "session_count", "skipped_domains"}
 
 
+def test_read_profile_cookies_skips_partitioned_rows(cookies_db: Path) -> None:
+    future = _future_chrome_utc()
+    # The same cookie name in both flavours: only the unpartitioned row is
+    # the first-party session's business; the partitioned (CHIPS) copy is
+    # third-party-scoped and must not be broadened to a global cookie.
+    insert_cookie(cookies_db, ".yandex.ru", name="pi",
+                  encrypted=encrypt_cookie(digest("yandex.ru") + b"first-party"),
+                  expires_utc=future, has_expires=1)
+    insert_cookie(cookies_db, ".yandex.ru", name="pi",
+                  encrypted=encrypt_cookie(digest("yandex.ru") + b"partitioned"),
+                  expires_utc=future, has_expires=1, top_frame_site_key="https://example.com")
+    insert_cookie(cookies_db, ".yandex.ru", name="Session_id",
+                  encrypted=encrypt_cookie(digest("yandex.ru") + b"x"),
+                  expires_utc=future, has_expires=1, top_frame_site_key="https://shop.example")
+
+    cookies, report = auth.read_profile_cookies(cookies_db, KEY)
+
+    imported = [(c["name"], c["value"]) for c in cookies]
+    assert imported == [("pi", "first-party")]
+    assert report.skipped_partitioned == 2
+
+
+def test_read_profile_cookies_rejects_reduced_key_collision(cookies_db: Path) -> None:
+    future = _future_chrome_utc()
+    # Two distinct Chrome rows (the real unique index also keys on
+    # source_scheme/source_port) that collapse onto the same CDP key.
+    insert_cookie(cookies_db, ".yandex.ru", name="dupe",
+                  encrypted=encrypt_cookie(digest("yandex.ru") + b"one"),
+                  expires_utc=future, has_expires=1)
+    insert_cookie(cookies_db, ".yandex.ru", name="dupe",
+                  encrypted=encrypt_cookie(digest("yandex.ru") + b"two"),
+                  expires_utc=future, has_expires=1)
+
+    with pytest.raises(SessionImportError, match="collide"):
+        auth.read_profile_cookies(cookies_db, KEY)
+
+
+def test_read_profile_cookies_retries_transient_select_failure(cookies_db: Path, monkeypatch) -> None:
+    insert_cookie(cookies_db, ".yandex.ru", encrypted=encrypt_cookie(digest("yandex.ru") + b"one"),
+                  expires_utc=_future_chrome_utc(), has_expires=1)
+
+    class FlakyConnection:
+        """Real connection whose first execute() raises like a live-DB lock.
+
+        The failure counter is a class attribute: the retry loop opens a fresh
+        connection per attempt, and the simulated hiccup must fire once in
+        total, not once per attempt.
+        """
+
+        failures_left = 1
+
+        def __init__(self, real: sqlite3.Connection) -> None:
+            self._real = real
+
+        @property
+        def row_factory(self):
+            return self._real.row_factory
+
+        @row_factory.setter
+        def row_factory(self, value) -> None:
+            self._real.row_factory = value
+
+        def execute(self, *args: object):
+            if FlakyConnection.failures_left:
+                FlakyConnection.failures_left -= 1
+                raise sqlite3.OperationalError("database is locked")
+            return self._real.execute(*args)
+
+        def close(self) -> None:
+            self._real.close()
+
+    real_connect = sqlite3.connect
+    monkeypatch.setattr(
+        auth.sqlite3, "connect", lambda *a, **k: FlakyConnection(real_connect(*a, **k))
+    )
+    cookies, _report = auth.read_profile_cookies(cookies_db, KEY)
+    assert [c["value"] for c in cookies] == ["one"]
+
+
 def test_read_profile_cookies_requires_usable_rows(cookies_db: Path) -> None:
     insert_cookie(cookies_db, ".example.com", encrypted=encrypt_cookie(b"junk"))
     with pytest.raises(SessionImportError, match="No usable Yandex cookies"):
@@ -260,12 +342,13 @@ def test_fetch_keychain_password_rejects_non_darwin(monkeypatch) -> None:
 
 def test_logout_prints_counters(monkeypatch) -> None:
     async def fake_logout_session(cdp_url: str) -> LogoutReport:
-        return LogoutReport(deleted=369, remaining=0)
+        return LogoutReport(deleted=369, remaining=0, partitioned_left=4)
 
     monkeypatch.setattr(auth, "logout_session", fake_logout_session)
     result = CliRunner().invoke(cli.main, ["logout"])
     assert result.exit_code == 0
     assert "Удалено Yandex-кук: 369" in result.output
+    assert "оставлено партиционированных, не относящихся к сессии: 4" in result.output
     assert "отсутствует" in result.output
 
 

@@ -342,10 +342,12 @@ def login(
             ctx.exit(1)
         return
     report = _invoke(auth.import_session(cdp_url, from_chrome_profile))
-    skipped = report.skipped_expired + report.skipped_empty + report.skipped_domains
+    skipped = (
+        report.skipped_expired + report.skipped_empty + report.skipped_domains + report.skipped_partitioned
+    )
     click.echo(
         f"Перенесено кук: {report.imported} (сессионных, не переживут перезапуск Chrome: "
-        f"{report.session_count}; пропущено истёкших/пустых/посторонних: {skipped}; "
+        f"{report.session_count}; пропущено истёкших/пустых/посторонних/партиционированных: {skipped}; "
         f"не применилось: {report.mismatched_after_set})"
     )
     click.echo(f"Домены: {', '.join(report.domains)}")
@@ -364,5 +366,8 @@ def logout(cdp_url: str) -> None:
     from wordstat import auth
 
     report = _invoke(auth.logout_session(cdp_url))
-    click.echo(f"Удалено Yandex-кук: {report.deleted} (осталось: {report.remaining})")
+    click.echo(
+        f"Удалено Yandex-кук: {report.deleted} (осталось: {report.remaining}; "
+        f"оставлено партиционированных, не относящихся к сессии: {report.partitioned_left})"
+    )
     click.echo("Авторизация в Wordstat отсутствует")
