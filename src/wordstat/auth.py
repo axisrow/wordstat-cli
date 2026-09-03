@@ -250,12 +250,20 @@ def read_profile_cookies(cookies_db: Path, key: bytes) -> tuple[list[dict[str, A
                 " has_expires, is_secure, is_httponly, samesite, top_frame_site_key FROM cookies"
             ).fetchall()
             break
-        except sqlite3.OperationalError as error:
+        except sqlite3.DatabaseError as error:
+            # OperationalError subclasses DatabaseError, so this branch must
+            # separate: lock contention is transient (retry below), while any
+            # other OperationalError (missing table, corrupt schema) is a
+            # permanently unusable source that retrying only hides behind a
+            # misleading "Chrome was writing it" message.
+            if not (
+                isinstance(error, sqlite3.OperationalError)
+                and ("locked" in str(error).lower() or "busy" in str(error).lower())
+            ):
+                raise SessionImportError(f"{cookies_db} is not a readable Chrome cookie database: {error}") from error
             locked_error = error
             if attempt < 2:
                 time.sleep(0.2)
-        except sqlite3.DatabaseError as error:
-            raise SessionImportError(f"{cookies_db} is not a readable Chrome cookie database: {error}") from error
         finally:
             if connection is not None:
                 connection.close()
@@ -460,6 +468,13 @@ async def logout_session(cdp_url: str) -> LogoutReport:
                     "domain": cookie["domain"],
                     "path": cookie["path"],
                     "expires": 1,  # 1970-01-01: Chrome drops the cookie on set
+                    # Chrome's __Secure-/__Host- prefix rules validate these
+                    # flags against the name on every set; echoing the stored
+                    # values keeps the overwrite admissible for any prefixed
+                    # cookie (none exist on Yandex today, but the rule is
+                    # Chrome's, not Wordstat's).
+                    "secure": bool(cookie.get("secure")),
+                    "httpOnly": bool(cookie.get("httpOnly")),
                 }
                 for cookie in doomed
             ]

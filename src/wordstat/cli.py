@@ -303,9 +303,9 @@ def _invoke[T](coro: Awaitable[T]) -> T:
     "--from-chrome-profile",
     "from_chrome_profile",
     type=click.Path(path_type=Path, exists=True, file_okay=False),
-    default=_DEFAULT_CHROME_PROFILE,
-    show_default=True,
-    help="Local Chrome profile whose Yandex cookies (an already logged-in session) to transfer.",
+    default=None,
+    help="Local Chrome profile whose Yandex cookies (an already logged-in session) to transfer."
+    f" [default: {_DEFAULT_CHROME_PROFILE}]",
 )
 @click.option("--cdp-url", envvar="WORDSTAT_CDP_URL", default=_DEFAULT_CDP_URL, show_default=True)
 @click.option(
@@ -334,6 +334,17 @@ def login(
     # cryptography import that only the session commands need.
     from wordstat import auth
 
+    if from_chrome_profile is None:
+        # Resolved here, not as the option default: a click default is
+        # type-converted (and exists-checked) at startup, which would abort
+        # `login --check` — which never touches the profile — on any machine
+        # without the everyday-Chrome path.
+        from_chrome_profile = _DEFAULT_CHROME_PROFILE
+        if not from_chrome_profile.is_dir():
+            raise click.ClickException(
+                f"Default Chrome profile not found at {from_chrome_profile};"
+                " pass --from-chrome-profile"
+            )
     if check_only:
         if _invoke(auth.check_auth(cdp_url)):
             click.echo("Авторизация в Wordstat подтверждена")
