@@ -48,6 +48,20 @@ QUERY_SELECTOR = 'input[placeholder="Введите слово или слово
 SEARCH_SELECTOR = ".wordstat__search-button"
 DOWNLOAD_SELECTOR = "button.save-button"
 DOWNLOAD_CSV_MENU_ITEM_SELECTOR = "a[download]:has(button.save-csv-button)"
+# The click target inside the menu item. The <a download> and its inner
+# <button class="save-csv-button"> are NOT interchangeable (issue #62,
+# root-caused live 2026-09-09): the button's React handler fetches
+# POST /wordstat/api/getAllTableData and only after the response replaces the
+# anchor's preliminary blob (header-only for top_popular/top_related while the
+# DOM already shows ~200 rows) with the full-data blob and triggers the
+# download. Clicking the anchor itself dispatches the event on the anchor —
+# it bubbles up past the button, so the button's handler never fires and the
+# anchor's native default action downloads the stale header-only blob
+# instantly. dynamics/regions only ever worked through the anchor because
+# their preliminary blob is already complete. The button is also why a top
+# view's real download can trail the click by tens of seconds (measured
+# >15s for a 134KB top_popular export) — the poll timeout must cover that.
+DOWNLOAD_CSV_BUTTON_SELECTOR = "a[download] button.save-csv-button"
 TABLE_VIEW_SELECTOR = "label[for='table']"
 GRANULARITY_SELECTOR = ".wordstat__content-type_select > button"
 DATE_RANGE_SELECTOR = ".range-datepicker__selected-dates > button"
@@ -1384,12 +1398,15 @@ class WordstatCollector:
         before = self._resolved_file_snapshot(downloads_path, session)
         before_escaped = self._escaped_download_paths(downloads_path, session)
         # "Скачать" now opens a format menu (CSV / XLSX) instead of downloading
-        # directly; a second click on the CSV entry is required.
+        # directly; a second click on the CSV entry is required. The wait uses
+        # the menu-item anchor selector, but the click must land on the inner
+        # button — see DOWNLOAD_CSV_BUTTON_SELECTOR for why clicking the anchor
+        # downloads a stale header-only blob (issue #62).
         await self._click(page, DOWNLOAD_SELECTOR)
         await self._wait_for(
             page, f"() => Boolean(document.querySelector({json.dumps(DOWNLOAD_CSV_MENU_ITEM_SELECTOR)}))"
         )
-        await self._click(page, DOWNLOAD_CSV_MENU_ITEM_SELECTOR)
+        await self._click(page, DOWNLOAD_CSV_BUTTON_SELECTOR)
         return await self._poll_current_view_download(
             session, downloads_path, before, before_escaped
         )
