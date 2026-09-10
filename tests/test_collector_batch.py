@@ -466,7 +466,7 @@ def test_collect_one_retries_empty_table_exports_using_csv_content(monkeypatch, 
 
     download_count = 0
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         nonlocal download_count
         download_count += 1
         source = dl_path / f"export-{download_count}.csv"
@@ -506,7 +506,7 @@ def test_collect_one_rejects_csv_for_a_different_phrase_before_writing(monkeypat
     async def fake_select_view(self, page, selector, view):
         pass
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         source = dl_path / "export.csv"
         source.write_text(
             "Запросы со словами;Число запросов;Топ частотных запросов «другая фраза», Россия\n",
@@ -540,7 +540,7 @@ def test_collect_one_rejects_different_phrase_after_empty_export_retry(monkeypat
     async def fake_select_view(self, page, selector, view):
         pass
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         nonlocal download_count
         download_count += 1
         source = dl_path / f"export-{download_count}.csv"
@@ -578,7 +578,7 @@ def test_collect_one_rejects_different_phrase_on_nonempty_dynamics_export(monkey
     async def fake_select_view(self, page, selector, view):
         pass
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         nonlocal download_count
         download_count += 1
         source = dl_path / f"export-{download_count}.csv"
@@ -621,7 +621,7 @@ def test_collect_one_accepts_persistent_empty_top_exports_after_retry(monkeypatc
 
     download_count = 0
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         nonlocal download_count
         download_count += 1
         source = dl_path / f"export-{download_count}.csv"
@@ -672,7 +672,7 @@ def test_collect_one_keeps_empty_top_export_when_retry_times_out(monkeypatch, tm
 
     download_count = 0
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         nonlocal download_count
         download_count += 1
         if download_count == 1:
@@ -713,7 +713,7 @@ def test_collect_one_preserves_first_csv_when_retry_overwrites_path(monkeypatch,
 
     download_count = 0
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         nonlocal download_count
         download_count += 1
         source = dl_path / "export.csv"
@@ -753,7 +753,7 @@ def test_collect_one_cleans_retry_backup_when_copy_fails(monkeypatch, tmp_path):
     async def fake_select_view(self, page, selector, view):
         pass
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         source = dl_path / "export.csv"
         _write_empty_view_csv(source)
         return source, None
@@ -786,9 +786,13 @@ def test_collect_one_does_not_swallow_non_timeout_top_retry_error(monkeypatch, t
     async def fake_select_view(self, page, selector, view):
         pass
 
-    async def fake_download(self, page, session, dl_path):
+    download_count = 0
+
+    async def fake_download(self, page, session, dl_path, view=None):
+        nonlocal download_count
+        download_count += 1
         source = dl_path / "export.csv"
-        if source.exists():
+        if download_count > 1:
             raise InterfaceChangedError("simulated changed export control")
         _write_empty_view_csv(source)
         return source, None
@@ -815,9 +819,13 @@ def test_collect_one_does_not_swallow_ambiguous_top_retry_timeout(monkeypatch, t
     async def fake_select_view(self, page, selector, view):
         pass
 
-    async def fake_download(self, page, session, dl_path):
+    download_count = 0
+
+    async def fake_download(self, page, session, dl_path, view=None):
+        nonlocal download_count
+        download_count += 1
         source = dl_path / "export.csv"
-        if source.exists():
+        if download_count > 1:
             raise DownloadTimeoutError("Wordstat produced more than one new CSV for a single export")
         _write_empty_view_csv(source)
         return source, None
@@ -846,7 +854,7 @@ def test_collect_one_does_not_swallow_dynamics_retry_timeout(monkeypatch, tmp_pa
 
     download_count = 0
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         nonlocal download_count
         download_count += 1
         source = dl_path / f"export-{download_count}.csv"
@@ -888,7 +896,7 @@ def test_collect_one_keeps_dynamics_empty_export_fail_closed(monkeypatch, tmp_pa
 
     download_count = 0
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         nonlocal download_count
         download_count += 1
         source = dl_path / f"export-{download_count}.csv"
@@ -929,7 +937,7 @@ def test_collect_one_does_not_retry_an_empty_regions_export(monkeypatch, tmp_pat
 
     download_count = 0
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         nonlocal download_count
         download_count += 1
         source = dl_path / f"export-{download_count}.csv"
@@ -974,7 +982,7 @@ def test_collect_one_preserves_a_table_snapshot_for_the_next_phrase(monkeypatch,
     async def wait(self, page, expression, seconds=None, required=True):
         waits.append((expression, seconds, required))
 
-    async def download(self, page, session, directory):
+    async def download(self, page, session, directory, view=None):
         nonlocal download_count
         download_count += 1
         source = directory / f"export-{download_count}.csv"
@@ -1020,7 +1028,7 @@ def test_collect_one_rescues_the_csv_into_the_run_directory_on_write_failure(mon
 
     call_count = {"n": 0}
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         call_count["n"] += 1
         source = dl_path / f"export-{call_count['n']}.csv"
         _write_view_csv(source, "тест")
@@ -1064,7 +1072,7 @@ def test_collect_one_rescue_does_not_error_when_finalize_raw_already_moved_the_f
     async def fake_select_view(self, page, selector, view):
         pass
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         source = dl_path / "export.csv"
         _write_view_csv(source, "тест")
         return source, None
@@ -1127,7 +1135,7 @@ def test_collect_one_returns_a_partial_result_when_one_view_fails(monkeypatch, t
 
     call_count = {"n": 0}
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         call_count["n"] += 1
         if call_count["n"] == 4:
             raise DownloadTimeoutError("simulated: Wordstat never produced a CSV for regions")
@@ -1199,7 +1207,7 @@ def test_collect_one_rejects_invalid_dynamics_before_writing_parquet(
 
     download_count = 0
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         nonlocal download_count
         download_count += 1
         source = dl_path / f"export-{download_count}.csv"
@@ -1255,7 +1263,7 @@ def test_collect_one_records_untried_views_after_a_non_final_view_fails(monkeypa
 
     call_count = {"n": 0}
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         call_count["n"] += 1
         if call_count["n"] == 2:
             raise DownloadTimeoutError("simulated: top_related never downloaded")
@@ -1306,7 +1314,7 @@ def test_collect_one_still_propagates_authentication_loss_mid_phrase(monkeypatch
 
     call_count = {"n": 0}
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         call_count["n"] += 1
         if call_count["n"] == 2:
             raise AuthenticationRequiredError("simulated: session logged out mid-phrase")
@@ -1341,7 +1349,7 @@ def test_collect_one_raises_when_every_view_fails(monkeypatch, tmp_path):
     async def fake_select_view(self, page, selector, view):
         pass
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         raise DownloadTimeoutError("simulated: nothing ever downloads")
 
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
@@ -1376,7 +1384,7 @@ def test_collect_one_writes_the_manifest_after_every_view_not_only_at_the_end(mo
 
     call_count = {"n": 0}
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         call_count["n"] += 1
         source = dl_path / f"export-{call_count['n']}.csv"
         _write_view_csv(source, "тест")
@@ -1435,7 +1443,7 @@ def test_collect_one_resume_directory_only_collects_missing_views(monkeypatch, t
 
     call_count = {"n": 0}
 
-    async def failing_after_first_download(self, page, session, dl_path):
+    async def failing_after_first_download(self, page, session, dl_path, view=None):
         call_count["n"] += 1
         if call_count["n"] > 1:
             raise RuntimeError("simulated interruption")
@@ -1471,7 +1479,7 @@ def test_collect_one_resume_directory_only_collects_missing_views(monkeypatch, t
     # Second pass: resume, and this time let every remaining view succeed.
     call_count["n"] = 0
 
-    async def succeeding_download(self, page, session, dl_path):
+    async def succeeding_download(self, page, session, dl_path, view=None):
         call_count["n"] += 1
         source = dl_path / f"resume-{call_count['n']}.csv"
         _write_view_csv(source, "тест")
@@ -1519,7 +1527,7 @@ def test_collect_one_resume_prunes_stale_export_when_parquet_is_missing_and_retr
 
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
 
-    async def succeeding_download(self, page, session, dl_path):
+    async def succeeding_download(self, page, session, dl_path, view=None):
         source = dl_path / "export.csv"
         _write_view_csv(source, "тест")
         return source, None
@@ -1545,7 +1553,7 @@ def test_collect_one_resume_prunes_stale_export_when_parquet_is_missing_and_retr
     (run_directory / regions_export.file).unlink()
 
     # Resume, and this time make the re-attempted view's download fail.
-    async def failing_download(self, page, session, dl_path):
+    async def failing_download(self, page, session, dl_path, view=None):
         raise DownloadTimeoutError("simulated: regions re-collection failed on resume")
 
     monkeypatch.setattr(WordstatCollector, "_download_current_view", failing_download)
@@ -1577,7 +1585,7 @@ def test_collect_one_resume_directory_rejects_a_different_phrase(monkeypatch, tm
     async def fake_select_view(self, page, selector, view):
         pass
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         source = dl_path / "export.csv"
         _write_view_csv(source, "чай")
         return source, None
@@ -1696,7 +1704,7 @@ def test_collect_one_fresh_manifest_uses_url_after_phrase_setup(monkeypatch, tmp
 
     call_count = 0
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         nonlocal call_count
         call_count += 1
         source = dl_path / f"export-{call_count}.csv"
@@ -1742,7 +1750,7 @@ def test_collect_one_resume_updates_source_url_and_updated_at_but_not_created_at
     async def fake_select_view(self, page, selector, view):
         pass
 
-    async def failing_download(self, page, session, dl_path):
+    async def failing_download(self, page, session, dl_path, view=None):
         raise RuntimeError("simulated interruption before any view finished")
 
     monkeypatch.setattr(WordstatCollector, "_select_view", fake_select_view)
@@ -1764,7 +1772,7 @@ def test_collect_one_resume_updates_source_url_and_updated_at_but_not_created_at
     original_source_url = first_manifest.source_url
     original_updated_at = first_manifest.updated_at
 
-    async def succeeding_download(self, page, session, dl_path):
+    async def succeeding_download(self, page, session, dl_path, view=None):
         source = dl_path / "export.csv"
         _write_view_csv(source, "тест")
         return source, None
@@ -1810,7 +1818,7 @@ def test_collect_one_resume_updates_timestamp_before_a_failed_view(monkeypatch, 
 
     first_call = True
 
-    async def first_pass_download(self, page, session, dl_path):
+    async def first_pass_download(self, page, session, dl_path, view=None):
         nonlocal first_call
         if not first_call:
             raise RuntimeError("simulated interruption")
@@ -1827,7 +1835,7 @@ def test_collect_one_resume_updates_timestamp_before_a_failed_view(monkeypatch, 
     first_result = asyncio.run(collector._collect_one(page, _FakeSession(), downloads_path, "тест", "Россия"))
     original_updated_at = first_result.manifest.updated_at
 
-    async def failing_resume_download(self, page, session, dl_path):
+    async def failing_resume_download(self, page, session, dl_path, view=None):
         raise RuntimeError("simulated resume failure")
 
     monkeypatch.setattr(WordstatCollector, "_download_current_view", failing_resume_download)
@@ -1860,7 +1868,7 @@ def test_collect_one_resume_of_an_already_complete_run_does_not_touch_the_manife
     async def fake_select_view(self, page, selector, view):
         pass
 
-    async def fake_download(self, page, session, dl_path):
+    async def fake_download(self, page, session, dl_path, view=None):
         source = dl_path / "export.csv"
         _write_view_csv(source, "тест")
         return source, None
