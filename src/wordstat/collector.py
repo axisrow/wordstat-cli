@@ -23,6 +23,7 @@ from wordstat.errors import (
     InterfaceChangedError,
     InvalidRequestError,
     PhraseEntryError,
+    WordstatError,
 )
 from wordstat.models import (
     BatchCollectionResult,
@@ -730,7 +731,7 @@ class WordstatCollector:
                 await self._set_granularity(page, granularity)
                 if date_from is not None:
                     await self._set_period(page, granularity, date_from, date_to)
-            source, warning = await self._download_current_view(page, session, downloads_path)
+            source, warning = await self._download_current_view(page, session, downloads_path, view=view)
             warnings = [warning] if warning is not None else []
             dataset = parse_wordstat_csv(source, view)
             _assert_export_phrase(dataset, phrase, view)
@@ -1353,6 +1354,17 @@ class WordstatCollector:
         restore it to the original path before returning. All other failures
         propagate unchanged. The single outer ``finally`` owns the temporary
         file through creation, copy, retry, restore, and cleanup.
+
+        Issue #62 point 3 (reopened 2026-09-10): the retry used to re-click
+        with the previous ``source`` still sitting in the downloads directory,
+        so a re-download under the same filename produced *no new path* and
+        the diff-snapshot raised DownloadNoNewPathError even though Chrome had
+        just written the full export over the old file — the code then
+        restored the empty backup and returned the stale dataset, which is
+        exactly how every top view in the 2026-09-10 live run ended up
+        header-only. Removing the backed-up file before the re-click makes
+        the replacement visible as a new path (the poll's size/mtime
+        baseline change covers the same-name overwrite as well).
         """
         if self.empty_export_retry_seconds > 0:
             await asyncio.sleep(self.empty_export_retry_seconds)
@@ -1366,9 +1378,10 @@ class WordstatCollector:
             ) as backup_file:
                 retry_backup = Path(backup_file.name)
             shutil.copy2(source, retry_backup)
+            source.unlink(missing_ok=True)
             try:
                 retry_source, retry_escape_warning = await self._download_current_view(
-                    page, session, downloads_path
+                    page, session, downloads_path, view=view
                 )
             except DownloadNoNewPathError:
                 if not _should_retry_empty_export(view, dataset):
@@ -1386,16 +1399,21 @@ class WordstatCollector:
                 retry_backup.unlink(missing_ok=True)
 
     async def _download_current_view(
-        self, page, session: BrowserSession, downloads_path: Path
+        self, page, session: BrowserSession, downloads_path: Path,
+        view: WordstatView | None = None,
     ) -> tuple[Path, str | None]:
         """Download the CSV for the currently selected view.
 
         The baselines are captured before clicking: ``downloaded_files`` is a
-        session-lifetime log, not a per-download collection.
+        session-lifetime log, not a per-download collection. ``view`` enables
+        the top-view data-row preference in the poll (see
+        ``_poll_current_view_download``); it is optional only so tests can
+        substitute this method with a view-less fake.
         """
         # Resolve paths while taking the snapshot so /tmp and /private/tmp do
         # not make one physical file look like two downloads.
         before = self._resolved_file_snapshot(downloads_path, session)
+        before_stats = {path: self._file_stat(path) for path in before}
         before_escaped = self._escaped_download_paths(downloads_path, session)
         # "Скачать" now opens a format menu (CSV / XLSX) instead of downloading
         # directly; a second click on the CSV entry is required. The wait uses
@@ -1408,7 +1426,7 @@ class WordstatCollector:
         )
         await self._click(page, DOWNLOAD_CSV_BUTTON_SELECTOR)
         return await self._poll_current_view_download(
-            session, downloads_path, before, before_escaped
+            session, downloads_path, before, before_stats, before_escaped, view=view
         )
 
     async def _poll_current_view_download(
@@ -1416,33 +1434,96 @@ class WordstatCollector:
         session: BrowserSession,
         downloads_path: Path,
         before: dict[Path, Path],
+        before_stats: dict[Path, tuple[int, int]],
         before_escaped: set[Path],
+        view: WordstatView | None = None,
     ) -> tuple[Path, str | None]:
-        """Poll for one non-empty CSV, while checking escaped downloads."""
+        """Poll for one non-empty CSV, while checking escaped downloads.
+
+        Issue #62 (reopened 2026-09-10): a single click can land a stale
+        header-only blob in the downloads directory *before* the button's
+        React handler finishes ``getAllTableData`` and triggers the real
+        download — and the real download reuses the same filename, replacing
+        the stale file in place. Two consequences, both fixed here:
+
+        * a candidate is any CSV that is new *or changed* (size/mtime vs the
+          pre-click baseline), so an in-place replacement is visible to the
+          diff, not just a new path;
+        * for the top views (the only ones whose preliminary blob is
+          header-only) a candidate without data rows is not accepted
+          immediately: it is remembered as a fallback and polling continues
+          until a data-bearing CSV appears, so the race resolves into the
+          full export instead of the stale one. At the deadline the fallback
+          is still returned — Wordstat may legitimately produce an empty top
+          export (getAllTableData returned no data), and the existing
+          retry/partial machinery downstream owns that case.
+        """
+        require_data_rows = view in (WordstatView.TOP_POPULAR, WordstatView.TOP_RELATED)
+        fallback: Path | None = None
+        fallback_warning: str | None = None
         deadline = time.monotonic() + self.timeout_seconds
         while time.monotonic() < deadline:
             current = self._resolved_file_snapshot(downloads_path, session)
-            csv_files = self._new_csv_files(before, current)
+            csv_files = self._changed_csv_files(before, before_stats, current)
             escape_warning = self._escape_warning(
                 downloads_path,
                 self._escaped_download_paths(downloads_path, session) - before_escaped,
             )
             if len(csv_files) == 1 and csv_files[0].stat().st_size > 0:
-                # An escape in this same tick must be returned as a warning;
-                # it will be hidden by the next call's session-log baseline.
-                return csv_files[0], escape_warning
+                if not require_data_rows or self._csv_has_data_rows(csv_files[0], view):
+                    # An escape in this same tick must be returned as a warning;
+                    # it will be hidden by the next call's session-log baseline.
+                    return csv_files[0], escape_warning
+                fallback = csv_files[0]
+                fallback_warning = escape_warning
             if len(csv_files) > 1:
                 raise DownloadTimeoutError("Wordstat produced more than one new CSV for a single export")
-            if escape_warning is not None:
+            if escape_warning is not None and fallback is None:
                 raise DownloadEscapedError(escape_warning)
             await asyncio.sleep(0.25)
+        if fallback is not None:
+            return fallback, fallback_warning
         raise DownloadNoNewPathError("Wordstat did not produce a new CSV before the download timeout")
 
     @staticmethod
-    def _new_csv_files(before: dict[Path, Path], current: dict[Path, Path]) -> list[Path]:
-        """Return CSVs newly observed in the downloads directory."""
-        new_resolved = set(current) - set(before)
-        return [current[path] for path in new_resolved if path.suffix.lower() == ".csv"]
+    def _file_stat(path: Path) -> tuple[int, int]:
+        """Size and mtime of a download, as an overwrite-detection key."""
+        stat = path.stat()
+        return (stat.st_size, stat.st_mtime_ns)
+
+    @staticmethod
+    def _changed_csv_files(
+        before: dict[Path, Path], before_stats: dict[Path, tuple[int, int]], current: dict[Path, Path]
+    ) -> list[Path]:
+        """Return CSVs newly observed *or replaced* since the baseline.
+
+        ``_new_csv_files`` only saw new paths, which made a same-name
+        re-download (Chrome overwriting the previous file) invisible — the
+        reopened #62 root cause behind the ineffective retry.
+        """
+        changed = {
+            current[path] for path in set(current) - set(before) if path.suffix.lower() == ".csv"
+        }
+        for path in set(current) & set(before_stats):
+            if path.suffix.lower() == ".csv" and WordstatCollector._file_stat(current[path]) != before_stats[path]:
+                changed.add(current[path])
+        return sorted(changed, key=str)
+
+    @staticmethod
+    def _csv_has_data_rows(path: Path, view: WordstatView | None) -> bool:
+        """Whether a downloaded CSV already contains data rows.
+
+        A readiness probe, not a validation: a file observed mid-write or in
+        an unparsable transient state simply reads as "not ready yet" and the
+        poll keeps waiting, so partial downloads are never mistaken for the
+        final export.
+        """
+        if view is None:
+            return True
+        try:
+            return bool(parse_wordstat_csv(path, view).rows)
+        except (WordstatError, UnicodeError):
+            return False
 
     @staticmethod
     def _escape_warning(directory: Path, escaped: set[Path]) -> str | None:
