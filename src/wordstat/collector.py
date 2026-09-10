@@ -1411,9 +1411,16 @@ class WordstatCollector:
         substitute this method with a view-less fake.
         """
         # Resolve paths while taking the snapshot so /tmp and /private/tmp do
-        # not make one physical file look like two downloads.
+        # not make one physical file look like two downloads. A file that
+        # vanishes between the snapshot and the stat pass (Chrome renaming or
+        # cleaning up) is simply absent from the stats baseline — it was not
+        # ours to track yet — instead of crashing with a bare FileNotFoundError.
         before = self._resolved_file_snapshot(downloads_path, session)
-        before_stats = {path: self._file_stat(path) for path in before}
+        before_stats = {
+            path: stat
+            for path in before
+            if (stat := self._file_stat(path)) is not None
+        }
         before_escaped = self._escaped_download_paths(downloads_path, session)
         # "Скачать" now opens a format menu (CSV / XLSX) instead of downloading
         # directly; a second click on the CSV entry is required. The wait uses
@@ -1469,7 +1476,8 @@ class WordstatCollector:
                 downloads_path,
                 self._escaped_download_paths(downloads_path, session) - before_escaped,
             )
-            if len(csv_files) == 1 and csv_files[0].stat().st_size > 0:
+            candidate_stat = self._file_stat(csv_files[0]) if len(csv_files) == 1 else None
+            if len(csv_files) == 1 and candidate_stat is not None and candidate_stat[0] > 0:
                 if not require_data_rows or self._csv_has_data_rows(csv_files[0], view):
                     # An escape in this same tick must be returned as a warning;
                     # it will be hidden by the next call's session-log baseline.
@@ -1486,9 +1494,16 @@ class WordstatCollector:
         raise DownloadNoNewPathError("Wordstat did not produce a new CSV before the download timeout")
 
     @staticmethod
-    def _file_stat(path: Path) -> tuple[int, int]:
-        """Size and mtime of a download, as an overwrite-detection key."""
-        stat = path.stat()
+    def _file_stat(path: Path) -> tuple[int, int] | None:
+        """Size and mtime of a download as an overwrite-detection key.
+
+        ``None`` if the file vanished before the stat — the caller treats
+        that as "nothing to compare against yet" rather than an error.
+        """
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
         return (stat.st_size, stat.st_mtime_ns)
 
     @staticmethod
@@ -1497,15 +1512,16 @@ class WordstatCollector:
     ) -> list[Path]:
         """Return CSVs newly observed *or replaced* since the baseline.
 
-        ``_new_csv_files`` only saw new paths, which made a same-name
-        re-download (Chrome overwriting the previous file) invisible — the
-        reopened #62 root cause behind the ineffective retry.
+        A new-path-only diff made a same-name re-download (Chrome
+        overwriting the previous file) invisible — the reopened #62 root
+        cause behind the ineffective retry.
         """
         changed = {
             current[path] for path in set(current) - set(before) if path.suffix.lower() == ".csv"
         }
         for path in set(current) & set(before_stats):
-            if path.suffix.lower() == ".csv" and WordstatCollector._file_stat(current[path]) != before_stats[path]:
+            stat = WordstatCollector._file_stat(current[path])
+            if path.suffix.lower() == ".csv" and stat is not None and stat != before_stats[path]:
                 changed.add(current[path])
         return sorted(changed, key=str)
 
@@ -1513,16 +1529,18 @@ class WordstatCollector:
     def _csv_has_data_rows(path: Path, view: WordstatView | None) -> bool:
         """Whether a downloaded CSV already contains data rows.
 
-        A readiness probe, not a validation: a file observed mid-write or in
-        an unparsable transient state simply reads as "not ready yet" and the
-        poll keeps waiting, so partial downloads are never mistaken for the
-        final export.
+        A readiness probe, not a validation: a file observed mid-write, in
+        an unparsable transient state, or already renamed/removed by Chrome
+        between the directory snapshot and this read simply reads as "not
+        ready yet" and the poll keeps waiting, so partial or vanishing
+        downloads are never mistaken for the final export (and never crash
+        the poll either).
         """
         if view is None:
             return True
         try:
             return bool(parse_wordstat_csv(path, view).rows)
-        except (WordstatError, UnicodeError):
+        except (WordstatError, UnicodeError, OSError):
             return False
 
     @staticmethod
