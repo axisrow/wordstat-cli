@@ -58,3 +58,16 @@ class CsvFormatError(WordstatError):
 
 class ResumeMismatchError(WordstatError):
     """--resume-dir does not belong to the requested phrase/region, or is unusable."""
+
+
+class SessionImportError(WordstatError):
+    """`wordstat login` could not transfer a Yandex session into the attached Chrome.
+
+    Covers every failure specific to importing cookies from another Chrome
+    profile: unsupported platform, a missing or denied Keychain entry, no
+    matching cookies in the source profile, an unsupported cookie encryption
+    format, cookies that Chrome refused to store, and an authorization check
+    that still fails after the import. Not a subclass of
+    AuthenticationRequiredError: the remedy is fixing the source/key, not
+    logging in inside the attached Chrome.
+    """

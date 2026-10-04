@@ -5,3 +5,4 @@ __pycache__/
 wordstat-output/
 debug.log
 info.log
+wordstat-output-test/
